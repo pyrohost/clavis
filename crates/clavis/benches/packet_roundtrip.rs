@@ -1,10 +1,21 @@
-use clavis::{EncryptedPacketStream, Role};
+use clavis::{define_user_packets, EncryptedPacketStream, Role};
 use criterion::{criterion_group, criterion_main, Criterion};
 use futures::channel::mpsc;
 use futures::StreamExt;
+use serde::{Deserialize, Serialize};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite};
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct PingPongData {
+    pub message: String,
+}
+
+define_user_packets!(
+    Ping = 1 => PingPongData,
+    Pong = 2 => PingPongData
+);
 
 struct DuplexStream {
     incoming: mpsc::Receiver<Vec<u8>>,
@@ -52,10 +63,7 @@ impl AsyncWrite for DuplexStream {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(
-        self: Pin<&mut Self>,
-        _: &mut Context<'_>,
-    ) -> Poll<Result<(), std::io::Error>> {
+    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
         Poll::Ready(Ok(()))
     }
 }
@@ -76,29 +84,49 @@ fn create_duplex_pair() -> (DuplexStream, DuplexStream) {
     )
 }
 
-fn key_exchange_benchmark(c: &mut Criterion) {
+async fn perform_roundtrip(
+    encrypted_stream: &mut EncryptedPacketStream<DuplexStream>,
+) -> clavis::Result<()> {
+    let ping = UserPacket::Ping(PingPongData {
+        message: "hello".to_string(),
+    });
+
+    encrypted_stream.write_packet(&ping).await?;
+    let _: UserPacket = encrypted_stream.read_packet().await?;
+
+    Ok(())
+}
+
+fn benchmark_packet_roundtrip(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
 
-    c.bench_function("key_exchange", |b| {
+    c.bench_function("packet_roundtrip", |b| {
         b.to_async(&rt).iter(|| async {
             let (client_stream, server_stream) = create_duplex_pair();
 
             let server_handle = tokio::spawn(async move {
-                let _server = EncryptedPacketStream::new(server_stream, Role::Server, None, None)
+                let mut server = EncryptedPacketStream::new(server_stream, Role::Server, None, None)
                     .await
-                    .expect("Server failed to perform key exchange");
+                    .expect("Failed to create server stream");
+
+                while let Ok(UserPacket::Ping(ping)) = server.read_packet::<UserPacket>().await {
+                    let pong = UserPacket::Pong(PingPongData {
+                        message: format!("Pong: {}", ping.message),
+                    });
+                    let _ = server.write_packet(&pong).await;
+                }
             });
 
-            let client = EncryptedPacketStream::new(client_stream, Role::Client, None, None)
+            let mut client = EncryptedPacketStream::new(client_stream, Role::Client, None, None)
                 .await
-                .expect("Client failed to perform key exchange");
+                .expect("Failed to create client stream");
 
-            server_handle.await.expect("Server task panicked");
-
-            criterion::black_box(client);
+            criterion::black_box(perform_roundtrip(&mut client).await.unwrap());
+            
+            server_handle.abort();
         });
     });
 }
 
-criterion_group!(benches, key_exchange_benchmark);
+criterion_group!(benches, benchmark_packet_roundtrip);
 criterion_main!(benches);

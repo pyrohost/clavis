@@ -4,7 +4,9 @@ use tokio::net::TcpListener;
 
 #[tokio::main]
 async fn main() -> clavis::Result<()> {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .init();
 
     let listener = TcpListener::bind("127.0.0.1:7272").await?;
     println!("Server listening on 127.0.0.1:7272");

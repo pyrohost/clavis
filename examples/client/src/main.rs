@@ -4,7 +4,9 @@ use tokio::net::TcpStream;
 
 #[tokio::main]
 async fn main() -> clavis::Result<()> {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .init();
 
     let stream = TcpStream::connect("127.0.0.1:7272").await?;
     let mut encrypted_stream = EncryptedPacketStream::new(stream, Role::Client, None, None).await?;

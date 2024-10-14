@@ -6,6 +6,7 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::fmt::Debug;
+use std::sync::Arc;
 use thiserror::Error;
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -56,14 +57,13 @@ pub trait Packet: Send + Sync + Sized + Debug {
     fn deserialize(packet_type: u8, data: &[u8]) -> Result<Self>;
 }
 
-#[derive(Debug)]
 pub struct EncryptedPacketStream<S>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     stream: S,
-    read_key: [u8; 32],
-    write_key: [u8; 32],
+    cipher_read: Arc<Aes256GcmSiv>,
+    cipher_write: Arc<Aes256GcmSiv>,
 }
 
 type KeyValidator = Option<Box<dyn Fn(&PublicKey) -> Result<()> + Send>>;
@@ -176,12 +176,21 @@ where
             }
         };
 
-        info!("Key derivation completed successfully");
+        let cipher_read = Arc::new(
+            Aes256GcmSiv::new_from_slice(&read_key)
+                .map_err(|_| PacketError::KeyDerivationFailed)?,
+        );
+        let cipher_write = Arc::new(
+            Aes256GcmSiv::new_from_slice(&write_key)
+                .map_err(|_| PacketError::KeyDerivationFailed)?,
+        );
+
+        info!("Key derivation and cipher initialization completed successfully");
 
         Ok(Self {
             stream,
-            read_key,
-            write_key,
+            cipher_read,
+            cipher_write,
         })
     }
 
@@ -195,19 +204,19 @@ where
         info!("Splitting EncryptedPacketStream into reader and writer");
         let EncryptedPacketStream {
             stream,
-            read_key,
-            write_key,
+            cipher_read,
+            cipher_write,
         } = self;
         let (read_half, write_half) = io::split(stream);
 
         let reader = EncryptedPacketReader {
             stream: read_half,
-            read_key,
+            cipher_read,
         };
 
         let writer = EncryptedPacketWriter {
             stream: write_half,
-            write_key,
+            cipher_write,
         };
 
         (reader, writer)
@@ -219,21 +228,21 @@ where
         P: Packet,
     {
         trace!("Preparing to read a packet");
-        let cipher = Aes256GcmSiv::new_from_slice(&self.read_key).map_err(|e| {
-            error!("Failed to create cipher: {}", e);
-            PacketError::Serialization("Failed to create cipher".into())
-        })?;
 
-        let packet_type_byte = read_u8(&mut self.stream).await?;
-        trace!("Read packet type: {}", packet_type_byte);
+        let mut header = [0u8; 5];
+        self.stream.read_exact(&mut header).await?;
+        let packet_type_byte = header[0];
+        let data_length = u32::from_le_bytes(header[1..5].try_into().unwrap());
+        trace!(
+            "Read packet type: {}, data length: {}",
+            packet_type_byte,
+            data_length
+        );
 
         if packet_type_byte == KEY_EXCHANGE_PACKET_TYPE {
             warn!("Received unexpected key exchange packet type during encrypted communication");
             return Err(PacketError::InvalidPacketType(packet_type_byte));
         }
-
-        let data_length = read_u32(&mut self.stream).await?;
-        trace!("Data length: {}", data_length);
 
         if data_length > MAX_DATA_LENGTH {
             warn!(
@@ -243,27 +252,30 @@ where
             return Err(PacketError::DataTooLarge);
         }
 
-        let mut data = vec![0u8; data_length as usize];
-        self.stream.read_exact(&mut data).await?;
-        trace!("Read encrypted data: {} bytes", data.len());
-
-        if data.len() < 12 {
-            error!("Encrypted data is too short: {}", data.len());
+        if data_length < 12 {
+            error!("Encrypted data is too short: {}", data_length);
             return Err(PacketError::Deserialization("Data too short".into()));
         }
 
-        let (nonce_bytes, ciphertext) = data.split_at(12);
-        let nonce = Nonce::from_slice(nonce_bytes);
+        let mut nonce_bytes = [0u8; 12];
+        self.stream.read_exact(&mut nonce_bytes).await?;
+        let nonce = Nonce::from_slice(&nonce_bytes);
         trace!("Nonce extracted for decryption");
+
+        let ciphertext_length = data_length as usize - 12;
+        let mut ciphertext = vec![0u8; ciphertext_length];
+        self.stream.read_exact(&mut ciphertext).await?;
+        trace!("Read encrypted data: {} bytes", ciphertext.len());
 
         let associated_data = &[packet_type_byte];
         trace!("Associated data for decryption: {:?}", associated_data);
 
-        let plaintext = cipher
+        let plaintext = self
+            .cipher_read
             .decrypt(
                 nonce,
                 Payload {
-                    msg: ciphertext,
+                    msg: &ciphertext,
                     aad: associated_data,
                 },
             )
@@ -283,10 +295,6 @@ where
         P: Packet,
     {
         trace!("Preparing to write a packet: {:?}", packet);
-        let cipher = Aes256GcmSiv::new_from_slice(&self.write_key).map_err(|e| {
-            error!("Failed to create cipher: {}", e);
-            PacketError::Serialization("Failed to create cipher".into())
-        })?;
 
         let data = packet.serialize()?;
         trace!("Serialized packet data");
@@ -307,7 +315,8 @@ where
         let associated_data = &[packet_type_byte];
         trace!("Associated data for encryption: {:?}", associated_data);
 
-        let ciphertext = cipher
+        let ciphertext = self
+            .cipher_write
             .encrypt(
                 nonce,
                 Payload {
@@ -321,14 +330,7 @@ where
             })?;
         trace!("Encryption successful");
 
-        let encrypted_data = [nonce_bytes.as_ref(), ciphertext.as_ref()].concat();
-        trace!("Encrypted data length: {}", encrypted_data.len());
-
-        write_u8(&mut self.stream, packet_type_byte).await?;
-        trace!("Wrote packet type byte");
-
-        let data_length = encrypted_data.len() as u32;
-        trace!("Encrypted data length as u32: {}", data_length);
+        let data_length = (nonce_bytes.len() + ciphertext.len()) as u32;
         if data_length > MAX_DATA_LENGTH {
             warn!(
                 "Encrypted data length {} exceeds maximum allowed size {}",
@@ -336,24 +338,28 @@ where
             );
             return Err(PacketError::DataTooLarge);
         }
-        write_u32(&mut self.stream, data_length).await?;
-        trace!("Wrote data length");
 
-        self.stream.write_all(&encrypted_data).await?;
-        trace!("Wrote encrypted data to stream");
+        let mut header = [0u8; 5];
+        header[0] = packet_type_byte;
+        header[1..5].copy_from_slice(&data_length.to_le_bytes());
+        self.stream.write_all(&header).await?;
+        trace!("Wrote packet header");
+
+        self.stream.write_all(&nonce_bytes).await?;
+        self.stream.write_all(&ciphertext).await?;
+        trace!("Wrote nonce and ciphertext to stream");
         self.stream.flush().await?;
         trace!("Flushed the stream");
         Ok(())
     }
 }
 
-#[derive(Debug)]
 pub struct EncryptedPacketReader<R>
 where
     R: AsyncRead + Unpin + Send,
 {
     stream: R,
-    read_key: [u8; 32],
+    cipher_read: Arc<Aes256GcmSiv>,
 }
 
 impl<R> EncryptedPacketReader<R>
@@ -366,21 +372,21 @@ where
         P: Packet,
     {
         trace!("Reader preparing to read a packet");
-        let cipher = Aes256GcmSiv::new_from_slice(&self.read_key).map_err(|e| {
-            error!("Failed to create cipher in reader: {}", e);
-            PacketError::Serialization("Failed to create cipher".into())
-        })?;
 
-        let packet_type_byte = read_u8(&mut self.stream).await?;
-        trace!("Reader read packet type: {}", packet_type_byte);
+        let mut header = [0u8; 5];
+        self.stream.read_exact(&mut header).await?;
+        let packet_type_byte = header[0];
+        let data_length = u32::from_le_bytes(header[1..5].try_into().unwrap());
+        trace!(
+            "Reader read packet type: {}, data length: {}",
+            packet_type_byte,
+            data_length
+        );
 
         if packet_type_byte == KEY_EXCHANGE_PACKET_TYPE {
             warn!("Reader received unexpected key exchange packet type");
             return Err(PacketError::InvalidPacketType(packet_type_byte));
         }
-
-        let data_length = read_u32(&mut self.stream).await?;
-        trace!("Reader data length: {}", data_length);
 
         if data_length > MAX_DATA_LENGTH {
             warn!(
@@ -390,18 +396,20 @@ where
             return Err(PacketError::DataTooLarge);
         }
 
-        let mut data = vec![0u8; data_length as usize];
-        self.stream.read_exact(&mut data).await?;
-        trace!("Reader read encrypted data: {} bytes", data.len());
-
-        if data.len() < 12 {
-            error!("Reader: Encrypted data is too short: {}", data.len());
+        if data_length < 12 {
+            error!("Encrypted data is too short: {}", data_length);
             return Err(PacketError::Deserialization("Data too short".into()));
         }
 
-        let (nonce_bytes, ciphertext) = data.split_at(12);
-        let nonce = Nonce::from_slice(nonce_bytes);
+        let mut nonce_bytes = [0u8; 12];
+        self.stream.read_exact(&mut nonce_bytes).await?;
+        let nonce = Nonce::from_slice(&nonce_bytes);
         trace!("Reader extracted nonce");
+
+        let ciphertext_length = data_length as usize - 12;
+        let mut ciphertext = vec![0u8; ciphertext_length];
+        self.stream.read_exact(&mut ciphertext).await?;
+        trace!("Reader read encrypted data: {} bytes", ciphertext.len());
 
         let associated_data = &[packet_type_byte];
         trace!(
@@ -409,11 +417,12 @@ where
             associated_data
         );
 
-        let plaintext = cipher
+        let plaintext = self
+            .cipher_read
             .decrypt(
                 nonce,
                 Payload {
-                    msg: ciphertext,
+                    msg: &ciphertext,
                     aad: associated_data,
                 },
             )
@@ -428,13 +437,12 @@ where
     }
 }
 
-#[derive(Debug)]
 pub struct EncryptedPacketWriter<W>
 where
     W: AsyncWrite + Unpin + Send,
 {
     stream: W,
-    write_key: [u8; 32],
+    cipher_write: Arc<Aes256GcmSiv>,
 }
 
 impl<W> EncryptedPacketWriter<W>
@@ -447,10 +455,6 @@ where
         P: Packet,
     {
         trace!("Writer preparing to write a packet: {:?}", packet);
-        let cipher = Aes256GcmSiv::new_from_slice(&self.write_key).map_err(|e| {
-            error!("Failed to create cipher in writer: {}", e);
-            PacketError::Serialization("Failed to create cipher".into())
-        })?;
 
         let data = packet.serialize()?;
         trace!("Writer serialized packet data");
@@ -474,7 +478,8 @@ where
             associated_data
         );
 
-        let ciphertext = cipher
+        let ciphertext = self
+            .cipher_write
             .encrypt(
                 nonce,
                 Payload {
@@ -488,14 +493,7 @@ where
             })?;
         trace!("Writer encryption successful");
 
-        let encrypted_data = [nonce_bytes.as_ref(), ciphertext.as_ref()].concat();
-        trace!("Writer encrypted data length: {}", encrypted_data.len());
-
-        write_u8(&mut self.stream, packet_type_byte).await?;
-        trace!("Writer wrote packet type byte");
-
-        let data_length = encrypted_data.len() as u32;
-        trace!("Writer encrypted data length as u32: {}", data_length);
+        let data_length = (nonce_bytes.len() + ciphertext.len()) as u32;
         if data_length > MAX_DATA_LENGTH {
             warn!(
                 "Writer encrypted data length {} exceeds maximum allowed size {}",
@@ -503,11 +501,16 @@ where
             );
             return Err(PacketError::DataTooLarge);
         }
-        write_u32(&mut self.stream, data_length).await?;
-        trace!("Writer wrote data length");
 
-        self.stream.write_all(&encrypted_data).await?;
-        trace!("Writer wrote encrypted data to stream");
+        let mut header = [0u8; 5];
+        header[0] = packet_type_byte;
+        header[1..5].copy_from_slice(&data_length.to_le_bytes());
+        self.stream.write_all(&header).await?;
+        trace!("Writer wrote packet header");
+
+        self.stream.write_all(&nonce_bytes).await?;
+        self.stream.write_all(&ciphertext).await?;
+        trace!("Writer wrote nonce and ciphertext to stream");
         self.stream.flush().await?;
         trace!("Writer flushed the stream");
         Ok(())
@@ -520,8 +523,17 @@ where
     S: AsyncRead + Unpin + Send,
 {
     trace!("Reading unencrypted packet");
-    let packet_type_byte = read_u8(stream).await?;
-    trace!("Unencrypted packet type byte: {}", packet_type_byte);
+
+    let mut header = [0u8; 5];
+    stream.read_exact(&mut header).await?;
+    let packet_type_byte = header[0];
+    let data_length = u32::from_le_bytes(header[1..5].try_into().unwrap());
+    trace!(
+        "Unencrypted packet type byte: {}, data length: {}",
+        packet_type_byte,
+        data_length
+    );
+
     if packet_type_byte != KEY_EXCHANGE_PACKET_TYPE {
         warn!(
             "Expected key exchange packet type {}, got {}",
@@ -530,8 +542,6 @@ where
         return Err(PacketError::InvalidPacketType(packet_type_byte));
     }
 
-    let data_length = read_u32(stream).await?;
-    trace!("Unencrypted packet data length: {}", data_length);
     if data_length > MAX_DATA_LENGTH {
         warn!(
             "Unencrypted packet data length {} exceeds maximum allowed size {}",
@@ -553,13 +563,10 @@ where
     S: AsyncWrite + Unpin + Send,
 {
     trace!("Writing unencrypted packet: {:?}", packet);
-    write_u8(stream, KEY_EXCHANGE_PACKET_TYPE).await?;
-    trace!("Wrote key exchange packet type byte");
 
     let data = match packet {
-        InternalPacket::KeyExchange(data) => data.clone(),
+        InternalPacket::KeyExchange(data) => data,
     };
-    trace!("Unencrypted packet data length: {}", data.len());
 
     let data_length = data.len() as u32;
     if data_length > MAX_DATA_LENGTH {
@@ -569,56 +576,17 @@ where
         );
         return Err(PacketError::DataTooLarge);
     }
-    write_u32(stream, data_length).await?;
-    trace!("Wrote unencrypted packet data length");
+
+    let mut header = [0u8; 5];
+    header[0] = KEY_EXCHANGE_PACKET_TYPE;
+    header[1..5].copy_from_slice(&data_length.to_le_bytes());
+    stream.write_all(&header).await?;
+    trace!("Wrote unencrypted packet header");
 
     stream.write_all(&data).await?;
     trace!("Wrote unencrypted packet data to stream");
     stream.flush().await?;
     trace!("Flushed the unencrypted stream");
-    Ok(())
-}
-
-#[instrument(level = "debug", skip(reader))]
-async fn read_u8<R>(reader: &mut R) -> Result<u8>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut buf = [0u8; 1];
-    reader.read_exact(&mut buf).await?;
-    trace!("Read u8: {}", buf[0]);
-    Ok(buf[0])
-}
-
-#[instrument(level = "debug", skip(reader))]
-async fn read_u32<R>(reader: &mut R) -> Result<u32>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut buf = [0u8; 4];
-    reader.read_exact(&mut buf).await?;
-    let value = u32::from_le_bytes(buf);
-    trace!("Read u32: {}", value);
-    Ok(value)
-}
-
-#[instrument(level = "debug", skip(writer))]
-async fn write_u8<W>(writer: &mut W, value: u8) -> Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
-    writer.write_all(&[value]).await?;
-    trace!("Wrote u8: {}", value);
-    Ok(())
-}
-
-#[instrument(level = "debug", skip(writer))]
-async fn write_u32<W>(writer: &mut W, value: u32) -> Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
-    writer.write_all(&value.to_le_bytes()).await?;
-    trace!("Wrote u32: {}", value);
     Ok(())
 }
 

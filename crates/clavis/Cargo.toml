@@ -25,6 +25,15 @@ tracing = "0.1.40"
 
 [dev-dependencies]
 criterion = { version = "0.5.1", features = ["async_tokio"] }
+futures = "0.3.31"
+
+[[bench]]
+name = "key_exchange"
+harness = false
+
+[[bench]]
+name = "packet_roundtrip"
+harness = false
 
 [badges]
 maintenance = { status = "actively-developed" }
