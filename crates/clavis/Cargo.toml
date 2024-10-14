@@ -5,6 +5,7 @@ edition = "2021"
 description = "A Rust library for secure, encrypted communication over asynchronous streams"
 authors = ["Pyro"]
 license = "MIT"
+readme = "../../README.md"
 repository = "https://github.com/pyrohost/clavis"
 keywords = ["encryption", "communication", "async", "security"]
 categories = ["cryptography", "asynchronous", "network-programming"]
