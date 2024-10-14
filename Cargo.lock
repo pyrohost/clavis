@@ -227,7 +227,7 @@ checksum = "1462739cb27611015575c0c11df5df7601141071f07518d56fcc1be504cbec97"
 
 [[package]]
 name = "clavis"
-version = "0.1.0"
+version = "0.1.1-rc1"
 dependencies = [
  "aes-gcm",
  "aes-gcm-siv",
