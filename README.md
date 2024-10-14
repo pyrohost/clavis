@@ -2,7 +2,6 @@
 
 ![Crates.io](https://img.shields.io/crates/v/clavis)
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
-![CI](https://github.com/pyrohost/clavis/workflows/CI/badge.svg)
 
 Clavis is a **Rust** library that facilitates **secure, encrypted communication** over asynchronous streams. Leveraging **X25519** for key exchange and **AES-256-GCM-SIV** for encryption, Clavis ensures the **confidentiality** and **integrity** of transmitted data while providing a **simple and efficient API**.
 
