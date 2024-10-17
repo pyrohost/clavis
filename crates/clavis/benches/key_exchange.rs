@@ -1,10 +1,10 @@
-use clavis::{EncryptedPacketStream, Role};
-use criterion::{criterion_group, criterion_main, Criterion};
+use clavis::{EncryptedStream, Role};
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use futures::channel::mpsc;
 use futures::StreamExt;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 struct DuplexStream {
     incoming: mpsc::Receiver<Vec<u8>>,
@@ -15,7 +15,7 @@ impl AsyncRead for DuplexStream {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
+        buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         match self.incoming.poll_next_unpin(cx) {
             Poll::Ready(Some(data)) => {
@@ -84,18 +84,18 @@ fn key_exchange_benchmark(c: &mut Criterion) {
             let (client_stream, server_stream) = create_duplex_pair();
 
             let server_handle = tokio::spawn(async move {
-                let _server = EncryptedPacketStream::new(server_stream, Role::Server, None, None)
+                let _server = EncryptedStream::new(server_stream, Role::Server, None, None)
                     .await
                     .expect("Server failed to perform key exchange");
             });
 
-            let client = EncryptedPacketStream::new(client_stream, Role::Client, None, None)
+            let client = EncryptedStream::new(client_stream, Role::Client, None, None)
                 .await
                 .expect("Client failed to perform key exchange");
 
             server_handle.await.expect("Server task panicked");
 
-            criterion::black_box(client);
+            black_box(client);
         });
     });
 }

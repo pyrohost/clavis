@@ -1,13 +1,12 @@
-use aes_gcm_siv::aead::{Aead, KeyInit, Payload};
-use aes_gcm_siv::{Aes256GcmSiv, Nonce};
+use chacha20poly1305::{
+    aead::{Aead, AeadCore, KeyInit},
+    XChaCha20Poly1305, XNonce,
+};
 use hkdf::Hkdf;
 use rand::rngs::OsRng;
-use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::fmt::Debug;
-use std::sync::Arc;
-use thiserror::Error;
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -20,7 +19,7 @@ pub use tracing;
 pub const MAX_DATA_LENGTH: u32 = 1024 * 1024 * 12;
 const KEY_EXCHANGE_PACKET_TYPE: u8 = 0;
 
-#[derive(Error, Debug)]
+#[derive(thiserror::Error, Debug)]
 pub enum PacketError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
@@ -32,10 +31,10 @@ pub enum PacketError {
     Serialization(String),
     #[error("Deserialization error: {0}")]
     Deserialization(String),
-    #[error("Decryption failed")]
-    DecryptionFailed,
-    #[error("Key derivation failed")]
-    KeyDerivationFailed,
+    #[error("Decryption failed: {0}")]
+    DecryptionFailed(String),
+    #[error("Key derivation failed: {0}")]
+    KeyDerivationFailed(String),
 }
 
 pub type Result<T> = std::result::Result<T, PacketError>;
@@ -52,23 +51,22 @@ enum InternalPacket {
 }
 
 pub trait Packet: Send + Sync + Sized + Debug {
-    fn packet_type(&self) -> u8;
     fn serialize(&self) -> Result<Vec<u8>>;
-    fn deserialize(packet_type: u8, data: &[u8]) -> Result<Self>;
+    fn deserialize(data: &[u8]) -> Result<Self>;
 }
 
-pub struct EncryptedPacketStream<S>
+pub struct EncryptedStream<S>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     stream: S,
-    cipher_read: Arc<Aes256GcmSiv>,
-    cipher_write: Arc<Aes256GcmSiv>,
+    cipher_read: XChaCha20Poly1305,
+    cipher_write: XChaCha20Poly1305,
 }
 
 type KeyValidator = Option<Box<dyn Fn(&PublicKey) -> Result<()> + Send>>;
 
-impl<S> EncryptedPacketStream<S>
+impl<S> EncryptedStream<S>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
@@ -79,17 +77,11 @@ where
         static_secret: Option<StaticSecret>,
         key_validator: KeyValidator,
     ) -> Result<Self> {
-        info!("Initializing EncryptedPacketStream");
-        let local_private_key = match static_secret {
-            Some(secret) => {
-                debug!("Using provided static secret");
-                secret
-            }
-            None => {
-                debug!("Generating new static secret");
-                StaticSecret::random_from_rng(OsRng)
-            }
-        };
+        info!("Initializing EncryptedStream");
+        let local_private_key = static_secret.unwrap_or_else(|| {
+            debug!("Generating new static secret");
+            StaticSecret::random_from_rng(OsRng)
+        });
         let local_public_key = PublicKey::from(&local_private_key);
         debug!("Local public key generated");
 
@@ -150,40 +142,7 @@ where
         let shared_secret_bytes = shared_secret.as_bytes();
         debug!("Shared secret computed via Diffie-Hellman");
 
-        let hk = Hkdf::<Sha256>::new(None, shared_secret_bytes);
-        let mut client_write_key = [0u8; 32];
-        let mut server_write_key = [0u8; 32];
-
-        hk.expand(b"client write key", &mut client_write_key)
-            .map_err(|_| {
-                error!("HKDF expand failed for client write key");
-                PacketError::KeyDerivationFailed
-            })?;
-        hk.expand(b"server write key", &mut server_write_key)
-            .map_err(|_| {
-                error!("HKDF expand failed for server write key");
-                PacketError::KeyDerivationFailed
-            })?;
-
-        let (write_key, read_key) = match role {
-            Role::Client => {
-                debug!("Client role selected keys");
-                (client_write_key, server_write_key)
-            }
-            Role::Server => {
-                debug!("Server role selected keys");
-                (server_write_key, client_write_key)
-            }
-        };
-
-        let cipher_read = Arc::new(
-            Aes256GcmSiv::new_from_slice(&read_key)
-                .map_err(|_| PacketError::KeyDerivationFailed)?,
-        );
-        let cipher_write = Arc::new(
-            Aes256GcmSiv::new_from_slice(&write_key)
-                .map_err(|_| PacketError::KeyDerivationFailed)?,
-        );
+        let (cipher_read, cipher_write) = derive_keys(shared_secret_bytes, role)?;
 
         info!("Key derivation and cipher initialization completed successfully");
 
@@ -195,326 +154,123 @@ where
     }
 
     #[instrument(level = "info", skip(self))]
-    pub fn split(
-        self,
-    ) -> (
-        EncryptedPacketReader<ReadHalf<S>>,
-        EncryptedPacketWriter<WriteHalf<S>>,
-    ) {
-        info!("Splitting EncryptedPacketStream into reader and writer");
-        let EncryptedPacketStream {
-            stream,
-            cipher_read,
-            cipher_write,
-        } = self;
-        let (read_half, write_half) = io::split(stream);
+    pub fn split(self) -> (EncryptedReader<ReadHalf<S>>, EncryptedWriter<WriteHalf<S>>) {
+        info!("Splitting EncryptedStream into reader and writer");
+        let (read_half, write_half) = io::split(self.stream);
 
-        let reader = EncryptedPacketReader {
+        let reader = EncryptedReader {
             stream: read_half,
-            cipher_read,
+            cipher: self.cipher_read,
         };
 
-        let writer = EncryptedPacketWriter {
+        let writer = EncryptedWriter {
             stream: write_half,
-            cipher_write,
+            cipher: self.cipher_write,
         };
 
         (reader, writer)
     }
 
-    #[instrument(level = "debug", skip(self))]
-    pub async fn read_packet<P>(&mut self) -> Result<P>
-    where
-        P: Packet,
-    {
-        trace!("Preparing to read a packet");
-
-        let mut header = [0u8; 5];
-        self.stream.read_exact(&mut header).await?;
-        let packet_type_byte = header[0];
-        let data_length = u32::from_le_bytes(header[1..5].try_into().unwrap());
-        trace!(
-            "Read packet type: {}, data length: {}",
-            packet_type_byte,
-            data_length
-        );
-
-        if packet_type_byte == KEY_EXCHANGE_PACKET_TYPE {
-            warn!("Received unexpected key exchange packet type during encrypted communication");
-            return Err(PacketError::InvalidPacketType(packet_type_byte));
-        }
-
-        if data_length > MAX_DATA_LENGTH {
-            warn!(
-                "Data length {} exceeds maximum allowed size {}",
-                data_length, MAX_DATA_LENGTH
-            );
-            return Err(PacketError::DataTooLarge);
-        }
-
-        if data_length < 12 {
-            error!("Encrypted data is too short: {}", data_length);
-            return Err(PacketError::Deserialization("Data too short".into()));
-        }
-
-        let mut nonce_bytes = [0u8; 12];
-        self.stream.read_exact(&mut nonce_bytes).await?;
-        let nonce = Nonce::from_slice(&nonce_bytes);
-        trace!("Nonce extracted for decryption");
-
-        let ciphertext_length = data_length as usize - 12;
-        let mut ciphertext = vec![0u8; ciphertext_length];
-        self.stream.read_exact(&mut ciphertext).await?;
-        trace!("Read encrypted data: {} bytes", ciphertext.len());
-
-        let associated_data = &[packet_type_byte];
-        trace!("Associated data for decryption: {:?}", associated_data);
-
-        let plaintext = self
-            .cipher_read
-            .decrypt(
-                nonce,
-                Payload {
-                    msg: &ciphertext,
-                    aad: associated_data,
-                },
-            )
-            .map_err(|e| {
-                error!("Decryption failed: {}", e);
-                PacketError::DecryptionFailed
-            })?;
-        trace!("Decryption successful");
-
-        let packet = P::deserialize(packet_type_byte, &plaintext)?;
-        Ok(packet)
+    pub async fn read_packet<P: Packet>(&mut self) -> Result<P> {
+        let data = read_message(&mut self.stream, &self.cipher_read).await?;
+        P::deserialize(&data)
     }
 
-    #[instrument(level = "debug", skip(self, packet))]
-    pub async fn write_packet<P>(&mut self, packet: &P) -> Result<()>
-    where
-        P: Packet,
-    {
-        trace!("Preparing to write a packet: {:?}", packet);
-
+    pub async fn write_packet(&mut self, packet: &impl Packet) -> Result<()> {
         let data = packet.serialize()?;
-        trace!("Serialized packet data");
-
-        let mut nonce_bytes = [0u8; 12];
-        OsRng.fill_bytes(&mut nonce_bytes);
-        let nonce = Nonce::from_slice(&nonce_bytes);
-        trace!("Generated nonce for encryption");
-
-        let packet_type_byte = packet.packet_type();
-        trace!("Packet type byte: {}", packet_type_byte);
-
-        if packet_type_byte == KEY_EXCHANGE_PACKET_TYPE {
-            warn!("Attempted to write a key exchange packet during encrypted communication");
-            return Err(PacketError::InvalidPacketType(packet_type_byte));
-        }
-
-        let associated_data = &[packet_type_byte];
-        trace!("Associated data for encryption: {:?}", associated_data);
-
-        let ciphertext = self
-            .cipher_write
-            .encrypt(
-                nonce,
-                Payload {
-                    msg: data.as_ref(),
-                    aad: associated_data,
-                },
-            )
-            .map_err(|e| {
-                error!("Encryption failed: {}", e);
-                PacketError::Serialization("Encryption failed".into())
-            })?;
-        trace!("Encryption successful");
-
-        let data_length = (nonce_bytes.len() + ciphertext.len()) as u32;
-        if data_length > MAX_DATA_LENGTH {
-            warn!(
-                "Encrypted data length {} exceeds maximum allowed size {}",
-                data_length, MAX_DATA_LENGTH
-            );
-            return Err(PacketError::DataTooLarge);
-        }
-
-        let mut header = [0u8; 5];
-        header[0] = packet_type_byte;
-        header[1..5].copy_from_slice(&data_length.to_le_bytes());
-        self.stream.write_all(&header).await?;
-        trace!("Wrote packet header");
-
-        self.stream.write_all(&nonce_bytes).await?;
-        self.stream.write_all(&ciphertext).await?;
-        trace!("Wrote nonce and ciphertext to stream");
-        self.stream.flush().await?;
-        trace!("Flushed the stream");
-        Ok(())
+        write_message(&mut self.stream, &self.cipher_write, &data).await
     }
 }
 
-pub struct EncryptedPacketReader<R>
+pub struct EncryptedReader<R>
 where
     R: AsyncRead + Unpin + Send,
 {
     stream: R,
-    cipher_read: Arc<Aes256GcmSiv>,
+    cipher: XChaCha20Poly1305,
 }
 
-impl<R> EncryptedPacketReader<R>
+impl<R> EncryptedReader<R>
 where
     R: AsyncRead + Unpin + Send,
 {
-    #[instrument(level = "debug", skip(self))]
-    pub async fn read_packet<P>(&mut self) -> Result<P>
-    where
-        P: Packet,
-    {
-        trace!("Reader preparing to read a packet");
-
-        let mut header = [0u8; 5];
-        self.stream.read_exact(&mut header).await?;
-        let packet_type_byte = header[0];
-        let data_length = u32::from_le_bytes(header[1..5].try_into().unwrap());
-        trace!(
-            "Reader read packet type: {}, data length: {}",
-            packet_type_byte,
-            data_length
-        );
-
-        if packet_type_byte == KEY_EXCHANGE_PACKET_TYPE {
-            warn!("Reader received unexpected key exchange packet type");
-            return Err(PacketError::InvalidPacketType(packet_type_byte));
-        }
-
-        if data_length > MAX_DATA_LENGTH {
-            warn!(
-                "Reader data length {} exceeds maximum allowed size {}",
-                data_length, MAX_DATA_LENGTH
-            );
-            return Err(PacketError::DataTooLarge);
-        }
-
-        if data_length < 12 {
-            error!("Encrypted data is too short: {}", data_length);
-            return Err(PacketError::Deserialization("Data too short".into()));
-        }
-
-        let mut nonce_bytes = [0u8; 12];
-        self.stream.read_exact(&mut nonce_bytes).await?;
-        let nonce = Nonce::from_slice(&nonce_bytes);
-        trace!("Reader extracted nonce");
-
-        let ciphertext_length = data_length as usize - 12;
-        let mut ciphertext = vec![0u8; ciphertext_length];
-        self.stream.read_exact(&mut ciphertext).await?;
-        trace!("Reader read encrypted data: {} bytes", ciphertext.len());
-
-        let associated_data = &[packet_type_byte];
-        trace!(
-            "Reader associated data for decryption: {:?}",
-            associated_data
-        );
-
-        let plaintext = self
-            .cipher_read
-            .decrypt(
-                nonce,
-                Payload {
-                    msg: &ciphertext,
-                    aad: associated_data,
-                },
-            )
-            .map_err(|e| {
-                error!("Reader decryption failed: {}", e);
-                PacketError::DecryptionFailed
-            })?;
-        trace!("Reader decryption successful");
-
-        let packet = P::deserialize(packet_type_byte, &plaintext)?;
-        Ok(packet)
+    pub async fn read_packet<P: Packet>(&mut self) -> Result<P> {
+        let data = read_message(&mut self.stream, &self.cipher).await?;
+        P::deserialize(&data)
     }
 }
 
-pub struct EncryptedPacketWriter<W>
+pub struct EncryptedWriter<W>
 where
     W: AsyncWrite + Unpin + Send,
 {
     stream: W,
-    cipher_write: Arc<Aes256GcmSiv>,
+    cipher: XChaCha20Poly1305,
 }
 
-impl<W> EncryptedPacketWriter<W>
+impl<W> EncryptedWriter<W>
 where
     W: AsyncWrite + Unpin + Send,
 {
-    #[instrument(level = "debug", skip(self, packet))]
-    pub async fn write_packet<P>(&mut self, packet: &P) -> Result<()>
-    where
-        P: Packet,
-    {
-        trace!("Writer preparing to write a packet: {:?}", packet);
-
+    pub async fn write_packet(&mut self, packet: &impl Packet) -> Result<()> {
         let data = packet.serialize()?;
-        trace!("Writer serialized packet data");
-
-        let mut nonce_bytes = [0u8; 12];
-        OsRng.fill_bytes(&mut nonce_bytes);
-        let nonce = Nonce::from_slice(&nonce_bytes);
-        trace!("Writer generated nonce for encryption");
-
-        let packet_type_byte = packet.packet_type();
-        trace!("Writer packet type byte: {}", packet_type_byte);
-
-        if packet_type_byte == KEY_EXCHANGE_PACKET_TYPE {
-            warn!("Writer attempted to write a key exchange packet during encrypted communication");
-            return Err(PacketError::InvalidPacketType(packet_type_byte));
-        }
-
-        let associated_data = &[packet_type_byte];
-        trace!(
-            "Writer associated data for encryption: {:?}",
-            associated_data
-        );
-
-        let ciphertext = self
-            .cipher_write
-            .encrypt(
-                nonce,
-                Payload {
-                    msg: data.as_ref(),
-                    aad: associated_data,
-                },
-            )
-            .map_err(|e| {
-                error!("Writer encryption failed: {}", e);
-                PacketError::Serialization("Encryption failed".into())
-            })?;
-        trace!("Writer encryption successful");
-
-        let data_length = (nonce_bytes.len() + ciphertext.len()) as u32;
-        if data_length > MAX_DATA_LENGTH {
-            warn!(
-                "Writer encrypted data length {} exceeds maximum allowed size {}",
-                data_length, MAX_DATA_LENGTH
-            );
-            return Err(PacketError::DataTooLarge);
-        }
-
-        let mut header = [0u8; 5];
-        header[0] = packet_type_byte;
-        header[1..5].copy_from_slice(&data_length.to_le_bytes());
-        self.stream.write_all(&header).await?;
-        trace!("Writer wrote packet header");
-
-        self.stream.write_all(&nonce_bytes).await?;
-        self.stream.write_all(&ciphertext).await?;
-        trace!("Writer wrote nonce and ciphertext to stream");
-        self.stream.flush().await?;
-        trace!("Writer flushed the stream");
-        Ok(())
+        write_message(&mut self.stream, &self.cipher, &data).await
     }
+}
+
+async fn read_message<R: AsyncRead + Unpin>(
+    stream: &mut R,
+    cipher: &XChaCha20Poly1305,
+) -> Result<Vec<u8>> {
+    let mut length_bytes = [0u8; 4];
+    stream.read_exact(&mut length_bytes).await?;
+    let length = u32::from_le_bytes(length_bytes) as usize;
+
+    if length > MAX_DATA_LENGTH as usize {
+        return Err(PacketError::DataTooLarge);
+    }
+
+    let mut nonce_bytes = [0u8; 24];
+    stream.read_exact(&mut nonce_bytes).await?;
+    let nonce = XNonce::from_slice(&nonce_bytes);
+
+    let mut buffer = vec![0u8; length];
+    stream.read_exact(&mut buffer).await?;
+
+    let plaintext = cipher.decrypt(nonce, buffer.as_ref()).map_err(|e| {
+        error!("Decryption failed: {}", e);
+        PacketError::DecryptionFailed(e.to_string())
+    })?;
+
+    Ok(plaintext)
+}
+
+async fn write_message<W: AsyncWrite + Unpin>(
+    stream: &mut W,
+    cipher: &XChaCha20Poly1305,
+    message: &[u8],
+) -> Result<()> {
+    if message.len() > MAX_DATA_LENGTH as usize {
+        return Err(PacketError::DataTooLarge);
+    }
+
+    let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+    let ciphertext = cipher.encrypt(&nonce, message).map_err(|e| {
+        error!("Encryption failed: {}", e);
+        PacketError::Serialization(format!("Encryption failed: {}", e))
+    })?;
+
+    let length = ciphertext.len() as u32;
+    if length > MAX_DATA_LENGTH {
+        return Err(PacketError::DataTooLarge);
+    }
+
+    stream.write_all(&length.to_le_bytes()).await?;
+    stream.write_all(&nonce).await?;
+    stream.write_all(&ciphertext).await?;
+    stream.flush().await?;
+
+    Ok(())
 }
 
 #[instrument(level = "debug", skip(stream))]
@@ -527,7 +283,11 @@ where
     let mut header = [0u8; 5];
     stream.read_exact(&mut header).await?;
     let packet_type_byte = header[0];
-    let data_length = u32::from_le_bytes(header[1..5].try_into().unwrap());
+    let data_length = u32::from_le_bytes(
+        header[1..5]
+            .try_into()
+            .expect("header[1..5] should be 4 bytes"),
+    );
     trace!(
         "Unencrypted packet type byte: {}, data length: {}",
         packet_type_byte,
@@ -563,10 +323,7 @@ where
     S: AsyncWrite + Unpin + Send,
 {
     trace!("Writing unencrypted packet: {:?}", packet);
-
-    let data = match packet {
-        InternalPacket::KeyExchange(data) => data,
-    };
+    let InternalPacket::KeyExchange(data) = packet;
 
     let data_length = data.len() as u32;
     if data_length > MAX_DATA_LENGTH {
@@ -577,65 +334,71 @@ where
         return Err(PacketError::DataTooLarge);
     }
 
-    let mut header = [0u8; 5];
-    header[0] = KEY_EXCHANGE_PACKET_TYPE;
-    header[1..5].copy_from_slice(&data_length.to_le_bytes());
-    stream.write_all(&header).await?;
-    trace!("Wrote unencrypted packet header");
+    let mut buffer = Vec::with_capacity(5 + data.len());
+    buffer.push(KEY_EXCHANGE_PACKET_TYPE);
+    buffer.extend_from_slice(&data_length.to_le_bytes());
+    buffer.extend_from_slice(data);
 
-    stream.write_all(&data).await?;
-    trace!("Wrote unencrypted packet data to stream");
+    stream.write_all(&buffer).await?;
     stream.flush().await?;
-    trace!("Flushed the unencrypted stream");
+    trace!("Wrote unencrypted packet to stream");
     Ok(())
 }
 
+fn derive_keys(shared_secret: &[u8], role: Role) -> Result<(XChaCha20Poly1305, XChaCha20Poly1305)> {
+    let hk = Hkdf::<Sha256>::new(None, shared_secret);
+    let mut client_key = [0u8; 32];
+    let mut server_key = [0u8; 32];
+
+    hk.expand(b"client stream key", &mut client_key)
+        .map_err(|e| {
+            error!("HKDF expand failed for client stream key: {}", e);
+            PacketError::KeyDerivationFailed(format!("HKDF expand failed: {}", e))
+        })?;
+    hk.expand(b"server stream key", &mut server_key)
+        .map_err(|e| {
+            error!("HKDF expand failed for server stream key: {}", e);
+            PacketError::KeyDerivationFailed(format!("HKDF expand failed: {}", e))
+        })?;
+
+    let (write_key, read_key) = match role {
+        Role::Client => {
+            debug!("Client role selected keys");
+            (client_key, server_key)
+        }
+        Role::Server => {
+            debug!("Server role selected keys");
+            (server_key, client_key)
+        }
+    };
+
+    Ok((
+        XChaCha20Poly1305::new(&read_key.into()),
+        XChaCha20Poly1305::new(&write_key.into()),
+    ))
+}
+
 #[macro_export]
-macro_rules! define_user_packets {
+macro_rules! define_packets {
     (
         $(
-            $packet_type:ident = $discriminant:expr => $data_struct:ty
+            $packet_type:ident $(( $data_struct:ty ))?
         ),* $(,)?
     ) => {
-        #[derive(Debug, Serialize, Deserialize)]
-        pub enum UserPacket {
+        #[derive(Debug, Clone, PartialEq, Eq, $crate::serde::Serialize, $crate::serde::Deserialize)]
+        pub enum Packet {
             $(
-                $packet_type($data_struct),
+                $packet_type $(($data_struct))?,
             )*
         }
-
-        impl $crate::Packet for UserPacket {
-            fn packet_type(&self) -> u8 {
-                match self {
-                    $(
-                        UserPacket::$packet_type(_) => $discriminant,
-                    )*
-                }
-            }
-
+        impl $crate::Packet for Packet {
             fn serialize(&self) -> $crate::Result<Vec<u8>> {
-                match self {
-                    $(
-                        UserPacket::$packet_type(data) => $crate::bincode::serialize(data)
-                            .map_err(|e| $crate::PacketError::Serialization(e.to_string())),
-                    )*
-                }
+                $crate::bincode::serialize(self)
+                    .map_err(|e| $crate::PacketError::Serialization(e.to_string()))
             }
-
-            fn deserialize(packet_type: u8, data: &[u8]) -> $crate::Result<Self> {
-                match packet_type {
-                    $(
-                        $discriminant => {
-                            let data = $crate::bincode::deserialize(data)
-                                .map_err(|e| $crate::PacketError::Deserialization(e.to_string()))?;
-                            Ok(UserPacket::$packet_type(data))
-                        },
-                    )*
-                    _ => {
-                        $crate::tracing::warn!("Attempted to deserialize unknown packet type: {}", packet_type);
-                        Err($crate::PacketError::InvalidPacketType(packet_type))
-                    },
-                }
+            fn deserialize(data: &[u8]) -> $crate::Result<Self> {
+                $crate::bincode::deserialize(data)
+                    .map_err(|e| $crate::PacketError::Deserialization(e.to_string()))
             }
         }
     };

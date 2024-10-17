@@ -1,12 +1,9 @@
-use clavis::define_user_packets;
+use clavis::define_packets;
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PingPongData {
     pub message: String,
 }
 
-define_user_packets!(
-    Ping = 1 => PingPongData,
-    Pong = 2 => PingPongData
-);
+define_packets!(Ping(PingPongData), Pong(PingPongData), Shutdown);
