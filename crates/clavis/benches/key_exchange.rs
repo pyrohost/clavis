@@ -84,12 +84,12 @@ fn key_exchange_benchmark(c: &mut Criterion) {
             let (client_stream, server_stream) = create_duplex_pair();
 
             let server_handle = tokio::spawn(async move {
-                let _server = EncryptedStream::new(server_stream, Role::Server, None, None)
+                let _server = EncryptedStream::new(server_stream, Role::Server, None)
                     .await
                     .expect("Server failed to perform key exchange");
             });
 
-            let client = EncryptedStream::new(client_stream, Role::Client, None, None)
+            let client = EncryptedStream::new(client_stream, Role::Client, None)
                 .await
                 .expect("Client failed to perform key exchange");
 

@@ -31,7 +31,7 @@ async fn main() -> Result<()> {
 }
 
 async fn handle_client(stream: tokio::net::TcpStream) -> Result<()> {
-    let encrypted_stream = EncryptedStream::new(stream, Role::Server, None, None).await?;
+    let encrypted_stream = EncryptedStream::new(stream, Role::Server, None).await?;
     let (mut reader, mut writer) = encrypted_stream.split();
 
     loop {

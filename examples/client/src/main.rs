@@ -13,7 +13,7 @@ async fn main() -> Result<()> {
     let stream = TcpStream::connect("127.0.0.1:7272").await?;
     info!("Connected to server");
 
-    let encrypted_stream = EncryptedStream::new(stream, Role::Client, None, None).await?;
+    let encrypted_stream = EncryptedStream::new(stream, Role::Client, None).await?;
     let (mut reader, mut writer) = encrypted_stream.split();
 
     for i in 1..=5 {

@@ -14,7 +14,12 @@ pub struct PingPongData {
     pub message: String,
 }
 
-define_packets!(Ping(PingPongData), Pong(PingPongData));
+define_packets! {
+    enum Packet {
+        Ping(PingPongData),
+        Pong(PingPongData),
+    }
+}
 
 struct DuplexStream {
     incoming: mpsc::Receiver<Vec<u8>>,
@@ -106,9 +111,7 @@ where
             assert_eq!(pong.message, "Pong: hello");
             Ok(())
         }
-        _ => Err(PacketError::Deserialization(
-            "Unexpected packet type".into(),
-        )),
+        _ => Err(PacketError::Deserialization),
     }
 }
 
@@ -120,7 +123,7 @@ fn benchmark_packet_roundtrip(c: &mut Criterion) {
             let (client_stream, server_stream) = create_duplex_pair();
 
             let server_handle = tokio::spawn(async move {
-                let server_stream = EncryptedStream::new(server_stream, Role::Server, None, None)
+                let server_stream = EncryptedStream::new(server_stream, Role::Server, None)
                     .await
                     .expect("Failed to create server stream");
 
@@ -147,7 +150,7 @@ fn benchmark_packet_roundtrip(c: &mut Criterion) {
                 Ok::<(), PacketError>(())
             });
 
-            let client_stream = EncryptedStream::new(client_stream, Role::Client, None, None)
+            let client_stream = EncryptedStream::new(client_stream, Role::Client, None)
                 .await
                 .expect("Failed to create client stream");
 

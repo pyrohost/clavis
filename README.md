@@ -3,7 +3,7 @@
 ![Crates.io](https://img.shields.io/crates/v/clavis)
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
 
-Clavis is a **Rust** library that facilitates **secure, encrypted communication** over asynchronous streams. It provides a robust framework for establishing encrypted connections and exchanging custom packets between clients and servers.
+Clavis is a **Rust** library that facilitates **secure, encrypted communication** over asynchronous streams. It provides a robust framework for establishing encrypted connections and exchanging custom packets between clients and servers. Clavis is built on top of the [Tokio](https://tokio.rs/) runtime and uses the [X25519](https://crates.io/crates/x25519-dalek) and [ChaCha20Poly1305](https://crates.io/crates/chacha20poly1305) crates for encryption and key exchange.
 
 ## Table of Contents
 
@@ -14,7 +14,6 @@ Clavis is a **Rust** library that facilitates **secure, encrypted communication*
     - [Client Example](#client-example)
     - [Server Example](#server-example)
 - [Advanced Usage](#advanced-usage)
-  - [Custom Key Validation](#custom-key-validation)
   - [Using Static Secrets](#using-static-secrets)
   - [Splitting Streams](#splitting-streams)
 - [API Documentation](#api-documentation)
@@ -37,7 +36,7 @@ tokio = { version = "1.0", features = ["full"] }
 Use the `define_packets!` macro to define your custom packet types:
 
 ```rust
-use clavis::define_packets;
+use clavis::{define_packets, PacketTrait};
 use serde::{Serialize, Deserialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -51,8 +50,10 @@ pub struct PongData {
 }
 
 define_packets! {
-    Ping(PingData),
-    Pong(PongData)
+    pub enum Packet {
+        Ping(PingData),
+        Pong(PongData)
+    }
 }
 ```
 
@@ -67,7 +68,7 @@ use tokio::net::TcpStream;
 #[tokio::main]
 async fn main() -> Result<()> {
     let stream = TcpStream::connect("127.0.0.1:7272").await?;
-    let mut client_stream = EncryptedStream::new(stream, Role::Client, None, None).await?;
+    let mut client_stream = EncryptedStream::new(stream, Role::Client, None).await?;
 
     // Create and send a Ping packet
     let ping = Packet::Ping(PingData {
@@ -107,7 +108,7 @@ async fn main() -> Result<()> {
 }
 
 async fn handle_client(stream: TcpStream) -> Result<()> {
-    let mut server_stream = EncryptedStream::new(stream, Role::Server, None, None).await?;
+    let mut server_stream = EncryptedStream::new(stream, Role::Server, None).await?;
 
     loop {
         match server_stream.read_packet().await? {
@@ -129,36 +130,20 @@ async fn handle_client(stream: TcpStream) -> Result<()> {
 
 ## Advanced Usage
 
-### Custom Key Validation
-
-You can provide a custom key validator function when creating an `EncryptedStream`:
-
-```rust
-let key_validator = |public_key: &PublicKey| {
-    // Implement your key validation logic here
-    Ok(())
-};
-
-let stream = EncryptedStream::new(
-    tcp_stream,
-    Role::Client,
-    None,
-    Some(Box::new(key_validator))
-).await?;
-```
-
 ### Using Static Secrets
 
 For scenarios requiring persistent identities, you can provide a static secret:
 
 ```rust
-let static_secret = StaticSecret::random_from_rng(OsRng);
+use x25519_dalek::StaticSecret;
+use rand::rngs::OsRng;
+
+let static_secret = StaticSecret::random_from_rng(&mut OsRng);
 
 let stream = EncryptedStream::new(
     tcp_stream,
     Role::Client,
-    Some(static_secret),
-    None
+    Some(static_secret)
 ).await?;
 ```
 

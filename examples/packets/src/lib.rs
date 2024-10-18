@@ -6,4 +6,10 @@ pub struct PingPongData {
     pub message: String,
 }
 
-define_packets!(Ping(PingPongData), Pong(PingPongData), Shutdown);
+define_packets! {
+    pub enum Packet {
+        Ping(PingPongData),
+        Pong(PingPongData),
+        Shutdown,
+    }
+}

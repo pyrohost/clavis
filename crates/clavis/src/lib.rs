@@ -16,9 +16,11 @@ pub use bincode;
 pub use serde;
 pub use tracing;
 
+/// Maximum allowed data length for packets (12 MiB).
 pub const MAX_DATA_LENGTH: u32 = 1024 * 1024 * 12;
 const KEY_EXCHANGE_PACKET_TYPE: u8 = 0;
 
+/// Custom error type for packet and encryption operations.
 #[derive(thiserror::Error, Debug)]
 pub enum PacketError {
     #[error("IO error: {0}")]
@@ -27,18 +29,19 @@ pub enum PacketError {
     InvalidPacketType(u8),
     #[error("Data length exceeds maximum allowed size")]
     DataTooLarge,
-    #[error("Serialization error: {0}")]
-    Serialization(String),
-    #[error("Deserialization error: {0}")]
-    Deserialization(String),
-    #[error("Decryption failed: {0}")]
-    DecryptionFailed(String),
-    #[error("Key derivation failed: {0}")]
-    KeyDerivationFailed(String),
+    #[error("Serialization error")]
+    Serialization,
+    #[error("Deserialization error")]
+    Deserialization,
+    #[error("Decryption failed")]
+    DecryptionFailed,
+    #[error("Key derivation failed")]
+    KeyDerivationFailed,
 }
 
 pub type Result<T> = std::result::Result<T, PacketError>;
 
+/// Role of the peer in the encrypted communication (Client or Server).
 #[derive(Debug, Clone, Copy)]
 pub enum Role {
     Client,
@@ -50,11 +53,15 @@ enum InternalPacket {
     KeyExchange(Vec<u8>),
 }
 
-pub trait Packet: Send + Sync + Sized + Debug {
+/// Trait that defines serialization and deserialization for packets.
+pub trait PacketTrait: Send + Sync + Sized + Debug {
+    /// Serializes the packet into a byte vector.
     fn serialize(&self) -> Result<Vec<u8>>;
+    /// Deserializes the packet from a byte slice.
     fn deserialize(data: &[u8]) -> Result<Self>;
 }
 
+/// Encrypted stream for secure communication over an underlying asynchronous stream.
 pub struct EncryptedStream<S>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -64,18 +71,16 @@ where
     cipher_write: XChaCha20Poly1305,
 }
 
-type KeyValidator = Option<Box<dyn Fn(&PublicKey) -> Result<()> + Send>>;
-
 impl<S> EncryptedStream<S>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    #[instrument(level = "info", skip(stream, key_validator, static_secret), fields(role = ?role))]
+    /// Creates a new `EncryptedStream` by performing an authenticated key exchange.
+    #[instrument(level = "info", skip(stream, static_secret), fields(role = ?role))]
     pub async fn new(
         mut stream: S,
         role: Role,
         static_secret: Option<StaticSecret>,
-        key_validator: KeyValidator,
     ) -> Result<Self> {
         info!("Initializing EncryptedStream");
         let local_private_key = static_secret.unwrap_or_else(|| {
@@ -110,33 +115,20 @@ where
             }
         };
 
-        trace!("Remote public key bytes: {:?}", remote_public_key_bytes);
+        trace!("Remote public key bytes received");
 
         if remote_public_key_bytes.len() != 32 {
-            error!(
-                "Invalid public key length: expected 32, got {}",
-                remote_public_key_bytes.len()
-            );
-            return Err(PacketError::Deserialization(
-                "Invalid public key length".into(),
-            ));
+            error!("Invalid public key length");
+            return Err(PacketError::Deserialization);
         }
 
         let remote_public_key_array: [u8; 32] =
             remote_public_key_bytes.as_slice().try_into().map_err(|_| {
                 error!("Failed to convert remote public key bytes to array");
-                PacketError::Deserialization("Invalid public key".into())
+                PacketError::Deserialization
             })?;
         let remote_public_key = PublicKey::from(remote_public_key_array);
         debug!("Remote public key deserialized successfully");
-
-        if let Some(ref validator) = key_validator {
-            info!("Validating remote public key");
-            validator(&remote_public_key)?;
-            debug!("Remote public key validated successfully");
-        } else {
-            debug!("No key validator provided");
-        }
 
         let shared_secret = local_private_key.diffie_hellman(&remote_public_key);
         let shared_secret_bytes = shared_secret.as_bytes();
@@ -153,6 +145,7 @@ where
         })
     }
 
+    /// Splits the `EncryptedStream` into an `EncryptedReader` and an `EncryptedWriter`.
     #[instrument(level = "info", skip(self))]
     pub fn split(self) -> (EncryptedReader<ReadHalf<S>>, EncryptedWriter<WriteHalf<S>>) {
         info!("Splitting EncryptedStream into reader and writer");
@@ -171,17 +164,20 @@ where
         (reader, writer)
     }
 
-    pub async fn read_packet<P: Packet>(&mut self) -> Result<P> {
+    /// Reads a packet from the encrypted stream.
+    pub async fn read_packet<P: PacketTrait>(&mut self) -> Result<P> {
         let data = read_message(&mut self.stream, &self.cipher_read).await?;
         P::deserialize(&data)
     }
 
-    pub async fn write_packet(&mut self, packet: &impl Packet) -> Result<()> {
+    /// Writes a packet to the encrypted stream.
+    pub async fn write_packet(&mut self, packet: &impl PacketTrait) -> Result<()> {
         let data = packet.serialize()?;
         write_message(&mut self.stream, &self.cipher_write, &data).await
     }
 }
 
+/// Encrypted reader for reading packets from the encrypted stream.
 pub struct EncryptedReader<R>
 where
     R: AsyncRead + Unpin + Send,
@@ -194,12 +190,14 @@ impl<R> EncryptedReader<R>
 where
     R: AsyncRead + Unpin + Send,
 {
-    pub async fn read_packet<P: Packet>(&mut self) -> Result<P> {
+    /// Reads a packet from the encrypted reader.
+    pub async fn read_packet<P: PacketTrait>(&mut self) -> Result<P> {
         let data = read_message(&mut self.stream, &self.cipher).await?;
         P::deserialize(&data)
     }
 }
 
+/// Encrypted writer for writing packets to the encrypted stream.
 pub struct EncryptedWriter<W>
 where
     W: AsyncWrite + Unpin + Send,
@@ -212,12 +210,14 @@ impl<W> EncryptedWriter<W>
 where
     W: AsyncWrite + Unpin + Send,
 {
-    pub async fn write_packet(&mut self, packet: &impl Packet) -> Result<()> {
+    /// Writes a packet to the encrypted writer.
+    pub async fn write_packet(&mut self, packet: &impl PacketTrait) -> Result<()> {
         let data = packet.serialize()?;
         write_message(&mut self.stream, &self.cipher, &data).await
     }
 }
 
+/// Reads an encrypted message from the stream.
 async fn read_message<R: AsyncRead + Unpin>(
     stream: &mut R,
     cipher: &XChaCha20Poly1305,
@@ -237,14 +237,15 @@ async fn read_message<R: AsyncRead + Unpin>(
     let mut buffer = vec![0u8; length];
     stream.read_exact(&mut buffer).await?;
 
-    let plaintext = cipher.decrypt(nonce, buffer.as_ref()).map_err(|e| {
-        error!("Decryption failed: {}", e);
-        PacketError::DecryptionFailed(e.to_string())
+    let plaintext = cipher.decrypt(nonce, buffer.as_ref()).map_err(|_| {
+        error!("Decryption failed");
+        PacketError::DecryptionFailed
     })?;
 
     Ok(plaintext)
 }
 
+/// Writes an encrypted message to the stream.
 async fn write_message<W: AsyncWrite + Unpin>(
     stream: &mut W,
     cipher: &XChaCha20Poly1305,
@@ -255,9 +256,9 @@ async fn write_message<W: AsyncWrite + Unpin>(
     }
 
     let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
-    let ciphertext = cipher.encrypt(&nonce, message).map_err(|e| {
-        error!("Encryption failed: {}", e);
-        PacketError::Serialization(format!("Encryption failed: {}", e))
+    let ciphertext = cipher.encrypt(&nonce, message).map_err(|_| {
+        error!("Encryption failed");
+        PacketError::Serialization
     })?;
 
     let length = ciphertext.len() as u32;
@@ -295,24 +296,18 @@ where
     );
 
     if packet_type_byte != KEY_EXCHANGE_PACKET_TYPE {
-        warn!(
-            "Expected key exchange packet type {}, got {}",
-            KEY_EXCHANGE_PACKET_TYPE, packet_type_byte
-        );
+        warn!("Invalid packet type");
         return Err(PacketError::InvalidPacketType(packet_type_byte));
     }
 
     if data_length > MAX_DATA_LENGTH {
-        warn!(
-            "Unencrypted packet data length {} exceeds maximum allowed size {}",
-            data_length, MAX_DATA_LENGTH
-        );
+        warn!("Data length exceeds maximum allowed size");
         return Err(PacketError::DataTooLarge);
     }
 
     let mut data = vec![0u8; data_length as usize];
     stream.read_exact(&mut data).await?;
-    trace!("Read unencrypted packet data: {} bytes", data.len());
+    trace!("Read unencrypted packet data");
 
     Ok(InternalPacket::KeyExchange(data))
 }
@@ -322,15 +317,12 @@ async fn write_packet_unencrypted<S>(stream: &mut S, packet: &InternalPacket) ->
 where
     S: AsyncWrite + Unpin + Send,
 {
-    trace!("Writing unencrypted packet: {:?}", packet);
+    trace!("Writing unencrypted packet");
     let InternalPacket::KeyExchange(data) = packet;
 
     let data_length = data.len() as u32;
     if data_length > MAX_DATA_LENGTH {
-        warn!(
-            "Unencrypted packet data length {} exceeds maximum allowed size {}",
-            data_length, MAX_DATA_LENGTH
-        );
+        warn!("Data length exceeds maximum allowed size");
         return Err(PacketError::DataTooLarge);
     }
 
@@ -345,20 +337,21 @@ where
     Ok(())
 }
 
+/// Derives encryption keys from the shared secret using HKDF.
 fn derive_keys(shared_secret: &[u8], role: Role) -> Result<(XChaCha20Poly1305, XChaCha20Poly1305)> {
     let hk = Hkdf::<Sha256>::new(None, shared_secret);
     let mut client_key = [0u8; 32];
     let mut server_key = [0u8; 32];
 
     hk.expand(b"client stream key", &mut client_key)
-        .map_err(|e| {
-            error!("HKDF expand failed for client stream key: {}", e);
-            PacketError::KeyDerivationFailed(format!("HKDF expand failed: {}", e))
+        .map_err(|_| {
+            error!("HKDF expand failed for client stream key");
+            PacketError::KeyDerivationFailed
         })?;
     hk.expand(b"server stream key", &mut server_key)
-        .map_err(|e| {
-            error!("HKDF expand failed for server stream key: {}", e);
-            PacketError::KeyDerivationFailed(format!("HKDF expand failed: {}", e))
+        .map_err(|_| {
+            error!("HKDF expand failed for server stream key");
+            PacketError::KeyDerivationFailed
         })?;
 
     let (write_key, read_key) = match role {
@@ -378,28 +371,60 @@ fn derive_keys(shared_secret: &[u8], role: Role) -> Result<(XChaCha20Poly1305, X
     ))
 }
 
+/// Macro to define packet types.
 #[macro_export]
 macro_rules! define_packets {
     (
         $(
-            $packet_type:ident $(( $data_struct:ty ))?
-        ),* $(,)?
+            $(#[$enum_meta:meta])*
+            $enum_vis:vis enum $enum_name:ident {
+                $(
+                    $(#[$variant_meta:meta])*
+                    $variant_vis:vis $variant:ident
+                    $(($inner:ty))?
+                    $({ $( $field_vis:vis $field:ident : $ftype:ty ),+ $(,)? })?
+                ),* $(,)?
+            }
+        )*
     ) => {
-        #[derive(Debug, Clone, PartialEq, Eq, $crate::serde::Serialize, $crate::serde::Deserialize)]
-        pub enum Packet {
-            $(
-                $packet_type $(($data_struct))?,
-            )*
-        }
-        impl $crate::Packet for Packet {
-            fn serialize(&self) -> $crate::Result<Vec<u8>> {
-                $crate::bincode::serialize(self)
-                    .map_err(|e| $crate::PacketError::Serialization(e.to_string()))
+        $(
+            #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+            $(#[$enum_meta])*
+            $enum_vis enum $enum_name {
+                $(
+                    $(#[$variant_meta])*
+                    $variant_vis $variant
+                    $(($inner))?
+                    $({ $( $field_vis $field : $ftype ),+ })?,
+                )*
             }
-            fn deserialize(data: &[u8]) -> $crate::Result<Self> {
-                $crate::bincode::deserialize(data)
-                    .map_err(|e| $crate::PacketError::Deserialization(e.to_string()))
+
+            impl $crate::PacketTrait for $enum_name {
+                fn serialize(&self) -> $crate::Result<Vec<u8>> {
+                    $crate::bincode::serialize(self).map_err(|e| {
+                        $crate::PacketError::Serialization
+                    })
+                }
+                fn deserialize(data: &[u8]) -> $crate::Result<Self> {
+                    $crate::bincode::deserialize(data).map_err(|e| {
+                        $crate::PacketError::Deserialization
+                    })
+                }
             }
-        }
+
+            impl std::fmt::Display for $enum_name {
+                fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    write!(f, "{:?}", self)
+                }
+            }
+
+            impl $enum_name {
+                pub fn variant_name(&self) -> &'static str {
+                    match self {
+                        $(Self::$variant { .. } => stringify!($variant),)*
+                    }
+                }
+            }
+        )*
     };
 }
