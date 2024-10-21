@@ -39,7 +39,7 @@ async fn handle_client(stream: tokio::net::TcpStream) -> Result<()> {
             Ok(Ok(Packet::Ping(ping))) => {
                 info!("Received Ping: {:?}", ping);
                 let pong = Packet::Pong(PingPongData {
-                    message: "world".to_string(),
+                    message: ping.message,
                 });
                 writer.write_packet(&pong).await?;
                 debug!("Sent Pong response");
