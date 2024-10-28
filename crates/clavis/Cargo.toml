@@ -8,7 +8,7 @@ repository = "https://github.com/pyrohost/clavis"
 license = "MIT"
 keywords = ["crypto", "network", "async", "encryption", "security"]
 categories = ["cryptography", "network-programming", "asynchronous"]
-readme = "README.md"
+readme = "../../README.md"
 
 [dependencies]
 # Async Runtime

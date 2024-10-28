@@ -178,7 +178,6 @@ fn generate_random_bytes<const N: usize>() -> [u8; N] {
 pub struct CryptoReader(CryptoContext);
 pub struct CryptoWriter(CryptoContext);
 
-// Implement methods for the public interface
 impl CryptoReader {
     #[inline]
     pub async fn read<R: AsyncRead + Unpin>(&self, stream: &mut R) -> ClavisResult<Vec<u8>> {
