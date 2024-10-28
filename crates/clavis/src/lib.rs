@@ -1,55 +1,102 @@
 #![forbid(unsafe_code)]
 
-//! # Clavis
+//! Clavis is a robust, asynchronous Rust library for establishing secure, encrypted
+//! communication channels over network streams. Built on tokio, it provides high-level
+//! abstractions for encrypted packet-based communication while maintaining strong security
+//! guarantees through modern cryptographic primitives.
 //!
-//! Clavis provides a secure and efficient abstraction, `EncryptedStream`, over asynchronous streams.
-//! It enables encrypted and authenticated communication using the XChaCha20Poly1305 algorithm, ensuring both
-//! data integrity and confidentiality.
+//! The library implements XChaCha20-Poly1305 encryption and features
+//! a type-safe protocol DSL macro for defining custom communication protocols and includes
+//! built-in serialization support.
 //!
-//! ## Usage Example
-//! ```rust,no_run
-//! use clavis::{EncryptedStream, Role, define_packets};
-//! use tokio::net::TcpStream;
+//! # Quick Start
 //!
-//! // Define a custom message structure
-//! #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-//! struct Message {
-//!     content: String,
-//! }
+//! Add Clavis to your `Cargo.toml`:
 //!
-//! // Use the define_packets! macro to create a custom packet enum
-//! define_packets! {
-//!     enum MyPacket {
-//!         VoidMessage,
-//!         Message(String),
-//!         StructMessage(Message),
-//!         StructuredMessage { content: String },
+//! ```toml
+//! [dependencies]
+//! clavis = { git = "https://github.com/pyrohost/clavis" }
+//! ```
+//!
+//! Define your protocol using the `protocol!` macro:
+//!
+//! ```rust
+//! use clavis::protocol;
+//!
+//! protocol! {
+//!     pub enum Message {
+//!         Ping(PingPongData),
+//!         Pong(PingPongData),
+//!         Shutdown,
 //!     }
 //! }
+//!
+//! #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+//! pub struct PingPongData {
+//!     pub message: String,
+//! }
+//! ```
+//!
+//! Create an encrypted connection:
+//!
+//! ```rust
+//! use clavis::{EncryptedStream, EncryptedPacket};
+//! use tokio::net::TcpStream;
+//!
+//! #[tokio::main]
+//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     let stream = TcpStream::connect("127.0.0.1:7272").await?;
+//!     let encrypted = EncryptedStream::new(stream, None).await?;
+//!     let (mut reader, mut writer) = encrypted.split()?;
+//!
+//!     let ping = Message::Ping(PingPongData {
+//!         message: "Hello!".into(),
+//!     });
+//!     writer.write_packet(&ping).await?;
+//!     
+//!     if let Message::Pong(pong) = reader.read_packet().await? {
+//!         println!("Received pong: {:?}", pong);
+//!     }
+//!
+//!     Ok(())
+//! }
+//! ```
+//!
+//! # Core Types
+//!
+//! The main types in Clavis are [`EncryptedStream`] for wrapping any AsyncRead + AsyncWrite stream,
+//! [`EncryptedPacket`] for defining the packet communication interface, and [`PacketTrait`] for
+//! protocol message serialization.
+//!
+//! Configure streams with [`EncryptedStreamOptions`]:
+//!
+//! ```rust
+//! use clavis::EncryptedStreamOptions;
+//!
+//! let options = EncryptedStreamOptions {
+//!     max_packet_size: 1024 * 1024,  // 1MB packet size limit
+//!     psk: Some(vec![/* 32 bytes of secure random data */]),
+//! };
 //! ```
 
 mod crypto;
 mod error;
-mod packet;
 mod stream;
-mod utils;
-
-#[cfg(test)]
-mod tests;
-
-pub use error::{PacketError, Result};
-pub use packet::PacketTrait;
-pub use stream::{EncryptedReader, EncryptedStream, EncryptedWriter, Role};
-
-/// Maximum allowed data length for packets (12 MiB).
-pub const MAX_DATA_LENGTH: u32 = 1024 * 1024 * 12;
 
 pub mod prelude {
     pub use {bincode, serde};
 }
 
+pub use error::*;
+pub use stream::{EncryptedPacket, EncryptedStream, EncryptedStreamOptions};
+
+pub trait PacketTrait: Send + Sync + Sized {
+    fn serialize(&self) -> ClavisResult<Vec<u8>>;
+    fn deserialize(data: &[u8]) -> ClavisResult<Self>;
+}
+
 #[macro_export]
-macro_rules! define_packets {
+macro_rules! protocol {
     (
         $(
             $(#[$enum_meta:meta])*
@@ -76,21 +123,26 @@ macro_rules! define_packets {
             }
 
             impl $crate::PacketTrait for $enum_name {
-                fn serialize(&self) -> $crate::Result<Vec<u8>> {
-                    $crate::prelude::bincode::serialize(self).map_err(|_| {
-                        $crate::PacketError::Serialization
-                    })
+                fn serialize(&self) -> $crate::ClavisResult<Vec<u8>> {
+                    $crate::prelude::bincode::serialize(self)
+                        .map_err(|e| $crate::ClavisError::serialization_failed(format!(
+                            "Failed to serialize {}: {}", stringify!($enum_name), e
+                        )))
                 }
-                fn deserialize(data: &[u8]) -> $crate::Result<Self> {
-                    $crate::prelude::bincode::deserialize(data).map_err(|_| {
-                        $crate::PacketError::Deserialization
-                    })
-                }
-            }
 
-            impl std::fmt::Display for $enum_name {
-                fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                    write!(f, "{:?}", self)
+                fn deserialize(data: &[u8]) -> $crate::ClavisResult<Self> {
+                    use $crate::MessageError;
+
+                    if data.is_empty() {
+                        return Err($crate::ClavisError::Message(
+                            MessageError::InvalidFormat("Empty packet data".into())
+                        ));
+                    }
+
+                    $crate::prelude::bincode::deserialize(data)
+                        .map_err(|e| $crate::ClavisError::deserialization_failed(format!(
+                            "Failed to deserialize {}: {}", stringify!($enum_name), e
+                        )))
                 }
             }
         )*

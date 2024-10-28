@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+anyhow = "1.0.91"
 clavis = { path = "../../crates/clavis" }
 packets = { path = "../packets" }
 tokio = { version = "1.40.0", features = ["full"] }

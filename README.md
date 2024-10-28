@@ -2,79 +2,88 @@
 
 ![Crates.io](https://img.shields.io/crates/v/clavis)
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
+![Rust Version](https://img.shields.io/badge/rust-1.75%2B-orange.svg)
 
-Clavis is a **Rust** library that provides secure, encrypted communication over asynchronous streams. It implements a robust protocol using XChaCha20Poly1305 for encryption and X25519 for key exchange, with optional pre-shared key (PSK) authentication. Built on top of the [Tokio](https://tokio.rs/) runtime, Clavis offers a high-level abstraction for building secure network applications.
+Clavis is an asynchronous Rust library designed for secure, encrypted communication over network streams. Built on `tokio`, it provides abstractions for encrypted packet-based communication with strong security guarantees, utilizing modern cryptographic primitives.
+
+The library implements XChaCha20-Poly1305 encryption, along with a type-safe protocol DSL macro for custom protocol definitions and built-in serialization.
 
 ## Installation
 
-Add Clavis to your `Cargo.toml`:
+To add Clavis to your project, include these dependencies in `Cargo.toml`:
 
 ```toml
 [dependencies]
-clavis = { git = "https://github.com/pyrohost/clavis.git" }
-serde = { version = "1.0", features = ["derive"] }
+clavis = { git = "https://github.com/pyrohost/clavis" }
 tokio = { version = "1.0", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
 ```
 
 ## Quick Start
 
-### 1. Define Your Packets
+### Defining a Protocol
 
-Use the `define_packets!` macro to create your packet types:
+Define custom protocol messages using the `protocol!` macro:
 
 ```rust
-use clavis::define_packets;
-use serde::{Deserialize, Serialize};
+use clavis::protocol;
+use serde::{Serialize, Deserialize};
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct StructPacket {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ChatMessage {
+    username: String,
     content: String,
+    timestamp: u64,
 }
 
-define_packets! {
-    pub enum MyPacket {
-        VoidMessage,
-        Message(String),
-        StructPacket(MyPacket),
-        StructuredMessage { content: String },
+protocol! {
+    enum ChatProtocol {
+        Heartbeat,
+        Join(String),
+        Leave(String),
+        Message(ChatMessage),
+        Status {
+            users_online: u32,
+            server_uptime: u64,
+        },
     }
 }
 ```
 
-### 2. Establish an Encrypted Connection
+### Client Implementation
 
-#### Client Example
+Set up a client to connect, send, and receive encrypted messages:
 
 ```rust
-use clavis::{EncryptedStream, Role};
+use clavis::{EncryptedStream, EncryptedStreamOptions, EncryptedPacket};
 use tokio::net::TcpStream;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Connect to the server
     let stream = TcpStream::connect("127.0.0.1:8080").await?;
-    
-    // Optional: Use a pre-shared key for additional security
-    let psk = b"my_secret_key";
-    
-    // Create an encrypted stream
-    let mut client = EncryptedStream::new(stream, Role::Client, Some(psk)).await?;
-    
-    // Send an encrypted message
-    client.write_packet(&MyPacket::Message("Hello, server!".to_string())).await?;
-    
-    // Receive the response
-    let response: MyPacket = client.read_packet().await?;
-    println!("Server response: {:?}", response);
+    let options = EncryptedStreamOptions {
+        max_packet_size: 65536,
+        psk: Some(b"pre-shared_key".to_vec()),
+    };
+    let encrypted = EncryptedStream::new(stream, Some(options)).await?;
+    let (mut reader, mut writer) = encrypted.split()?;
+
+    writer.write_packet(&ChatProtocol::Join("Alice".into())).await?;
+
+    if let Ok(packet) = reader.read_packet::<ChatProtocol>().await {
+        println!("Received packet: {:?}", packet);
+    }
     
     Ok(())
 }
 ```
 
-#### Server Example
+### Server Implementation
+
+Set up a server to handle encrypted client connections and process messages:
 
 ```rust
-use clavis::{EncryptedStream, Role};
+use clavis::{EncryptedStream, EncryptedStreamOptions, EncryptedPacket};
 use tokio::net::TcpListener;
 
 #[tokio::main]
@@ -83,19 +92,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Server listening on :8080");
 
     while let Ok((stream, addr)) = listener.accept().await {
-        println!("New connection from {}", addr);
-        let psk = b"my_secret_key";
-        
         tokio::spawn(async move {
-            match EncryptedStream::new(stream, Role::Server, Some(psk)).await {
-                Ok(mut server) => {
-                    if let Ok(packet) = server.read_packet::<MyPacket>().await {
-                        println!("Received: {:?}", packet);
-                        
-                        // Send a response
-                        let _ = server
-                            .write_packet(&MyPacket::Message("Hello, client!".to_string()))
-                            .await;
+            let options = EncryptedStreamOptions {
+                max_packet_size: 65536,
+                psk: Some(b"shared_secret".to_vec()),
+            };
+            match EncryptedStream::new(stream, Some(options)).await {
+                Ok(mut encrypted) => {
+                    if let Ok(packet) = encrypted.read_packet::<ChatProtocol>().await {
+                        println!("Received packet: {:?}", packet);
                     }
                 }
                 Err(e) => eprintln!("Connection error: {}", e),
@@ -107,26 +112,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-## Advanced Usage
+## Contributing
 
-### Splitting Streams
+We welcome contributions! For suggestions, bug reports, or feature requests, please open an issue or submit a pull request on our GitHub repository.
 
-You can split an `EncryptedStream` into separate reader and writer halves for concurrent operations:
+## Security
 
-```rust
-let (mut reader, mut writer) = encrypted_stream.split();
-
-// Use reader and writer independently
-tokio::spawn(async move {
-    while let Ok(packet) = reader.read_packet::<MyPacket>().await {
-        println!("Received: {:?}", packet);
-    }
-});
-
-// Write packets from another task
-writer.write_packet(&MyPacket::Message("Hello!".to_string())).await?;
-```
+Clavis is designed to provide strong security guarantees. However, no software is perfect, and security vulnerabilities may exist. If you discover a security issue, please report it [here](https://github.com/pyrohost/clavis/security) so we can address it promptly.
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.

@@ -1,11 +1,11 @@
-use clavis::{EncryptedStream, Result, Role};
+use clavis::{EncryptedPacket, EncryptedStream};
 use packets::{Packet, PingPongData};
 use tokio::net::TcpListener;
 use tokio::time::{timeout, Duration};
 use tracing::{debug, error, info, warn};
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::TRACE)
         .init();
@@ -30,9 +30,15 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn handle_client(stream: tokio::net::TcpStream) -> Result<()> {
-    let encrypted_stream = EncryptedStream::new(stream, Role::Server, None).await?;
-    let (mut reader, mut writer) = encrypted_stream.split();
+async fn handle_client(stream: tokio::net::TcpStream) -> anyhow::Result<()> {
+    let encrypted_stream = EncryptedStream::new(stream, None).await?;
+    let (mut reader, mut writer) = match encrypted_stream.split() {
+        Ok(split) => split,
+        Err(e) => {
+            error!("Failed to split encrypted stream: {:?}", e);
+            return Err(e.into());
+        }
+    };
 
     loop {
         match timeout(Duration::from_secs(30), reader.read_packet()).await {

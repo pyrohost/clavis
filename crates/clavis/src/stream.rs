@@ -1,303 +1,215 @@
-use chacha20poly1305::{aead::Aead, XChaCha20Poly1305, XNonce};
-use rand::{rngs::OsRng, RngCore};
-use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
-use tracing::{debug, error, info, instrument, warn};
-use x25519_dalek::{EphemeralSecret, PublicKey};
-
 use crate::{
-    crypto::{compute_salt, derive_ciphers},
-    error::{PacketError, Result},
-    packet::{InternalPacket, PacketTrait},
-    utils::{read_packet_unencrypted, write_packet_unencrypted},
-    MAX_DATA_LENGTH,
+    crypto::{CryptoCore, CryptoReader, CryptoWriter},
+    error::{ClavisError, ClavisResult, MessageError, StreamError},
+    PacketTrait,
 };
+use tokio::io::{AsyncRead, AsyncWrite, ReadHalf, WriteHalf};
+use tracing::warn;
 
-#[derive(Debug, Clone, Copy)]
-pub enum Role {
-    Client,
-    Server,
+/// Trait for handling encrypted packet operations
+pub trait EncryptedPacket {
+    /// Reads and deserializes an encrypted packet of type P
+    fn read_packet<P: PacketTrait>(
+        &mut self,
+    ) -> impl std::future::Future<Output = ClavisResult<P>> + Send
+    where
+        Self: Sized;
+
+    /// Serializes and writes an encrypted packet
+    fn write_packet(
+        &mut self,
+        packet: &impl PacketTrait,
+    ) -> impl std::future::Future<Output = ClavisResult<()>> + Send
+    where
+        Self: Sized;
 }
 
+/// Options for configuring an encrypted stream
+#[derive(Debug, Clone)]
+pub struct EncryptedStreamOptions {
+    /// The maximum size of a packet in bytes (default: 65536)
+    pub max_packet_size: usize,
+    /// A pre-shared key to use for the handshake (default: None)
+    pub psk: Option<Vec<u8>>,
+}
+
+impl Default for EncryptedStreamOptions {
+    fn default() -> Self {
+        Self {
+            max_packet_size: 65536,
+            psk: None,
+        }
+    }
+}
+
+/// Stream wrapper that handles both reading and writing encrypted data
 pub struct EncryptedStream<S>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     stream: S,
-    cipher_enc: XChaCha20Poly1305,
-    cipher_dec: XChaCha20Poly1305,
-    send_sequence: u64,
-    recv_sequence: u64,
+    crypto_reader: CryptoReader,
+    crypto_writer: CryptoWriter,
+    options: EncryptedStreamOptions,
 }
 
 impl<S> EncryptedStream<S>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    #[instrument(level = "info", skip(stream, psk), fields(role = ?role))]
-    pub async fn new(mut stream: S, role: Role, psk: Option<&[u8]>) -> Result<Self> {
-        info!("Initializing EncryptedStream");
-        if psk.is_none() {
-            warn!("PSK is None; key exchange is unauthenticated. MITM attacks are possible!");
+    /// Creates a new encrypted stream by establishing crypto parameters
+    pub async fn new(mut stream: S, options: Option<EncryptedStreamOptions>) -> ClavisResult<Self> {
+        let options = options.unwrap_or_default();
+        if options.psk.is_none() {
+            warn!("No pre-shared key is set, this connection may be vulnerable to man-in-the-middle attacks.");
         }
 
-        let local_ephemeral_secret = EphemeralSecret::random_from_rng(OsRng);
-        let local_ephemeral_public = PublicKey::from(&local_ephemeral_secret);
-        debug!("Local ephemeral public key generated");
+        let core = CryptoCore::establish(&mut stream, options.clone())
+            .await
+            .map_err(|e| {
+                ClavisError::crypto_failure(crate::error::CryptoOperation::Handshake, e.to_string())
+            })?;
 
-        let (shared_secret, remote_ephemeral_public, send_sequence, recv_sequence) = match role {
-            Role::Client => {
-                info!("Role: Client - initiating key exchange");
-
-                // Generate initial sequence number
-                let mut initial_sequence_bytes = [0u8; 8];
-                OsRng.fill_bytes(&mut initial_sequence_bytes);
-                let initial_sequence = u64::from_le_bytes(initial_sequence_bytes);
-
-                // Send our key exchange packet
-                let key_exchange = InternalPacket::KeyExchange {
-                    public_key: *local_ephemeral_public.as_bytes(),
-                    initial_sequence,
-                };
-                write_packet_unencrypted(&mut stream, &key_exchange, psk).await?;
-
-                // Receive server's key exchange
-                let server_key_exchange: InternalPacket =
-                    read_packet_unencrypted(&mut stream, psk).await?;
-
-                let (server_public_key, server_sequence) = match server_key_exchange {
-                    InternalPacket::KeyExchange {
-                        public_key,
-                        initial_sequence,
-                    } => (public_key, initial_sequence),
-                };
-
-                let remote_public = PublicKey::from(server_public_key);
-                let shared = local_ephemeral_secret.diffie_hellman(&remote_public);
-
-                (shared, remote_public, initial_sequence, server_sequence)
-            }
-            Role::Server => {
-                info!("Role: Server - responding to key exchange");
-
-                // Receive client's key exchange first
-                let client_key_exchange: InternalPacket =
-                    read_packet_unencrypted(&mut stream, psk).await?;
-
-                let (client_public_key, client_sequence) = match client_key_exchange {
-                    InternalPacket::KeyExchange {
-                        public_key,
-                        initial_sequence,
-                    } => (public_key, initial_sequence),
-                };
-
-                // Generate our initial sequence number
-                let mut initial_sequence_bytes = [0u8; 8];
-                OsRng.fill_bytes(&mut initial_sequence_bytes);
-                let initial_sequence = u64::from_le_bytes(initial_sequence_bytes);
-
-                // Send our key exchange response
-                let key_exchange = InternalPacket::KeyExchange {
-                    public_key: *local_ephemeral_public.as_bytes(),
-                    initial_sequence,
-                };
-                write_packet_unencrypted(&mut stream, &key_exchange, psk).await?;
-
-                let remote_public = PublicKey::from(client_public_key);
-                let shared = local_ephemeral_secret.diffie_hellman(&remote_public);
-
-                (shared, remote_public, initial_sequence, client_sequence)
-            }
-        };
-
-        debug!("Shared secret computed via Diffie-Hellman");
-
-        let salt = compute_salt(
-            local_ephemeral_public.as_bytes(),
-            remote_ephemeral_public.as_bytes(),
-            psk,
-        )?;
-
-        let (cipher_enc, cipher_dec) = derive_ciphers(shared_secret.as_bytes(), role, &salt)?;
-
-        info!("Key derivation and cipher initialization completed successfully");
-
+        let (crypto_reader, crypto_writer) = core.split();
         Ok(Self {
             stream,
-            cipher_enc,
-            cipher_dec,
-            send_sequence,
-            recv_sequence,
+            crypto_reader,
+            crypto_writer,
+            options,
         })
     }
 
-    #[instrument(level = "info", skip(self))]
-    pub fn split(self) -> (EncryptedReader<ReadHalf<S>>, EncryptedWriter<WriteHalf<S>>) {
-        info!("Splitting EncryptedStream into reader and writer");
-        let (read_half, write_half) = io::split(self.stream);
-
-        let reader = EncryptedReader {
-            stream: read_half,
-            cipher_dec: self.cipher_dec,
-            recv_sequence: self.recv_sequence,
-        };
-
-        let writer = EncryptedWriter {
-            stream: write_half,
-            cipher_enc: self.cipher_enc,
-            send_sequence: self.send_sequence,
-        };
-
-        (reader, writer)
-    }
-
-    pub async fn read_packet<P: PacketTrait>(&mut self) -> Result<P> {
-        let (data, sequence_number) = read_message(&mut self.stream, &self.cipher_dec).await?;
-        if sequence_number <= self.recv_sequence {
-            return Err(PacketError::ReplayAttack);
-        }
-        self.recv_sequence = sequence_number;
-        P::deserialize(&data)
-    }
-
-    pub async fn write_packet(&mut self, packet: &impl PacketTrait) -> Result<()> {
-        if self.send_sequence == u64::MAX {
-            return Err(PacketError::SequenceOverflow);
-        }
-        self.send_sequence = self.send_sequence.wrapping_add(1);
-        let data = packet.serialize()?;
-        write_message(
-            &mut self.stream,
-            &self.cipher_enc,
-            &data,
-            self.send_sequence,
-        )
-        .await
+    /// Splits the stream into separate reader and writer components
+    pub fn split(
+        self,
+    ) -> ClavisResult<(EncryptedReader<ReadHalf<S>>, EncryptedWriter<WriteHalf<S>>)> {
+        let (read, write) = tokio::io::split(self.stream);
+        Ok((
+            EncryptedReader::new(read, self.crypto_reader, self.options.clone()),
+            EncryptedWriter::new(write, self.crypto_writer, self.options),
+        ))
     }
 }
 
-pub struct EncryptedReader<R>
+impl<S> EncryptedPacket for EncryptedStream<S>
 where
-    R: AsyncRead + Unpin + Send,
+    S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    stream: R,
-    cipher_dec: XChaCha20Poly1305,
-    recv_sequence: u64,
-}
+    /// Reads and decrypts a packet from the stream
+    async fn read_packet<P: PacketTrait>(&mut self) -> ClavisResult<P> {
+        let data = self.crypto_reader.read(&mut self.stream).await?;
 
-impl<R> EncryptedReader<R>
-where
-    R: AsyncRead + Unpin + Send,
-{
-    pub async fn read_packet<P: PacketTrait>(&mut self) -> Result<P> {
-        let (data, sequence_number) = read_message(&mut self.stream, &self.cipher_dec).await?;
-        if sequence_number <= self.recv_sequence {
-            return Err(PacketError::ReplayAttack);
+        // Check packet size
+        if data.len() > self.options.max_packet_size {
+            return Err(ClavisError::Message(MessageError::MessageTooLarge {
+                size: data.len(),
+                max_size: self.options.max_packet_size,
+            }));
         }
-        self.recv_sequence = sequence_number;
-        P::deserialize(&data)
+
+        P::deserialize(&data).map_err(|e| ClavisError::deserialization_failed(e.to_string()))
     }
-}
 
-pub struct EncryptedWriter<W>
-where
-    W: AsyncWrite + Unpin + Send,
-{
-    stream: W,
-    cipher_enc: XChaCha20Poly1305,
-    send_sequence: u64,
-}
+    /// Encrypts and writes a packet to the stream
+    async fn write_packet(&mut self, packet: &impl PacketTrait) -> ClavisResult<()> {
+        let data = packet
+            .serialize()
+            .map_err(|e| ClavisError::serialization_failed(e.to_string()))?;
 
-impl<W> EncryptedWriter<W>
-where
-    W: AsyncWrite + Unpin + Send,
-{
-    pub async fn write_packet(&mut self, packet: &impl PacketTrait) -> Result<()> {
-        if self.send_sequence == u64::MAX {
-            return Err(PacketError::SequenceOverflow);
+        // Check packet size before encryption
+        if data.len() > self.options.max_packet_size {
+            return Err(ClavisError::Message(MessageError::MessageTooLarge {
+                size: data.len(),
+                max_size: self.options.max_packet_size,
+            }));
         }
-        self.send_sequence = self.send_sequence.wrapping_add(1);
-        let data = packet.serialize()?;
-        write_message(
-            &mut self.stream,
-            &self.cipher_enc,
-            &data,
-            self.send_sequence,
-        )
-        .await
+
+        self.crypto_writer.write(&mut self.stream, &data).await
     }
 }
 
-async fn read_message<R: AsyncRead + Unpin>(
-    stream: &mut R,
-    cipher: &XChaCha20Poly1305,
-) -> Result<(Vec<u8>, u64)> {
-    let mut header = [0u8; 4 + 24];
-    stream.read_exact(&mut header).await?;
-
-    let length = u32::from_le_bytes(header[..4].try_into().unwrap()) as usize;
-
-    if length > MAX_DATA_LENGTH as usize {
-        return Err(PacketError::DataTooLarge);
-    }
-
-    let nonce = XNonce::from_slice(&header[4..]);
-
-    let mut ciphertext = vec![0u8; length];
-    stream.read_exact(&mut ciphertext).await?;
-
-    let plaintext = cipher.decrypt(nonce, ciphertext.as_slice()).map_err(|_| {
-        error!("Decryption failed");
-        PacketError::Decryption
-    })?;
-
-    if plaintext.len() < 8 {
-        return Err(PacketError::Protocol);
-    }
-
-    let sequence_number = u64::from_le_bytes(plaintext[..8].try_into().unwrap());
-    let message = plaintext[8..].to_vec();
-
-    Ok((message, sequence_number))
+/// Handles reading encrypted data from a stream
+pub struct EncryptedReader<R> {
+    inner: R,
+    crypto: CryptoReader,
+    options: EncryptedStreamOptions,
 }
 
-async fn write_message<W: AsyncWrite + Unpin>(
-    stream: &mut W,
-    cipher: &XChaCha20Poly1305,
-    message: &[u8],
-    sequence_number: u64,
-) -> Result<()> {
-    if message.len() > MAX_DATA_LENGTH as usize - 8 {
-        return Err(PacketError::DataTooLarge);
+impl<R> EncryptedReader<R> {
+    /// Creates a new encrypted reader from a stream and crypto reader
+    fn new(inner: R, crypto: CryptoReader, options: EncryptedStreamOptions) -> Self {
+        Self {
+            inner,
+            crypto,
+            options,
+        }
+    }
+}
+
+/// Handles writing encrypted data to a stream
+pub struct EncryptedWriter<W> {
+    inner: W,
+    crypto: CryptoWriter,
+    options: EncryptedStreamOptions,
+}
+
+impl<W> EncryptedWriter<W> {
+    /// Creates a new encrypted writer from a stream and crypto writer
+    fn new(inner: W, crypto: CryptoWriter, options: EncryptedStreamOptions) -> Self {
+        Self {
+            inner,
+            crypto,
+            options,
+        }
+    }
+}
+
+impl<R: AsyncRead + Unpin + Send> EncryptedPacket for EncryptedReader<R> {
+    /// Reads and decrypts a packet from the read-only stream
+    async fn read_packet<P: PacketTrait>(&mut self) -> ClavisResult<P> {
+        let data = self.crypto.read(&mut self.inner).await?;
+
+        // Check packet size
+        if data.len() > self.options.max_packet_size {
+            return Err(ClavisError::Message(MessageError::MessageTooLarge {
+                size: data.len(),
+                max_size: self.options.max_packet_size,
+            }));
+        }
+
+        P::deserialize(&data).map_err(|e| ClavisError::deserialization_failed(e.to_string()))
     }
 
-    let mut sequence_message = Vec::with_capacity(8 + message.len());
-    sequence_message.extend_from_slice(&sequence_number.to_le_bytes());
-    sequence_message.extend_from_slice(message);
+    /// Returns an error as writing is not supported on a read-only stream
+    async fn write_packet(&mut self, _packet: &impl PacketTrait) -> ClavisResult<()> {
+        Err(ClavisError::Stream(StreamError::InvalidOperation(
+            "Cannot write to a read-only stream".into(),
+        )))
+    }
+}
 
-    let mut nonce_bytes = [0u8; 24];
-    nonce_bytes[..8].copy_from_slice(&sequence_number.to_le_bytes());
-    OsRng.fill_bytes(&mut nonce_bytes[8..]);
-    let nonce = XNonce::from_slice(&nonce_bytes);
-
-    let ciphertext = cipher
-        .encrypt(nonce, sequence_message.as_slice())
-        .map_err(|_| {
-            error!("Encryption failed");
-            PacketError::Encryption
-        })?;
-
-    let length = ciphertext.len() as u32;
-    if length > MAX_DATA_LENGTH {
-        return Err(PacketError::DataTooLarge);
+impl<W: AsyncWrite + Unpin + Send> EncryptedPacket for EncryptedWriter<W> {
+    /// Returns an error as reading is not supported on a write-only stream
+    async fn read_packet<P: PacketTrait>(&mut self) -> ClavisResult<P> {
+        Err(ClavisError::Stream(StreamError::InvalidOperation(
+            "Cannot read from a write-only stream".into(),
+        )))
     }
 
-    let mut buffer = Vec::with_capacity(4 + 24 + ciphertext.len());
-    buffer.extend_from_slice(&length.to_le_bytes());
-    buffer.extend_from_slice(&nonce_bytes);
-    buffer.extend_from_slice(&ciphertext);
+    /// Encrypts and writes a packet to the write-only stream
+    async fn write_packet(&mut self, packet: &impl PacketTrait) -> ClavisResult<()> {
+        let data = packet
+            .serialize()
+            .map_err(|e| ClavisError::serialization_failed(e.to_string()))?;
 
-    stream.write_all(&buffer).await?;
-    stream.flush().await?;
+        // Check packet size before encryption
+        if data.len() > self.options.max_packet_size {
+            return Err(ClavisError::Message(MessageError::MessageTooLarge {
+                size: data.len(),
+                max_size: self.options.max_packet_size,
+            }));
+        }
 
-    Ok(())
+        self.crypto.write(&mut self.inner, &data).await
+    }
 }

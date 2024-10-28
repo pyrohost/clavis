@@ -1,4 +1,4 @@
-use clavis::define_packets;
+use clavis::protocol;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -6,7 +6,7 @@ pub struct PingPongData {
     pub message: String,
 }
 
-define_packets! {
+protocol! {
     pub enum Packet {
         Ping(PingPongData),
         Pong(PingPongData),
