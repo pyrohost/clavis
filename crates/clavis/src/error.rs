@@ -4,32 +4,30 @@ use thiserror::Error;
 /// Represents the type of a cryptographic operation that failed
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CryptoOperation {
+    Authentication,
     Encryption,
     Decryption,
-    KeyDerivation,
     KeyExchange,
-    Authentication,
     Handshake,
 }
 
 impl fmt::Display for CryptoOperation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            CryptoOperation::Authentication => write!(f, "authentication"),
             CryptoOperation::Encryption => write!(f, "encryption"),
             CryptoOperation::Decryption => write!(f, "decryption"),
-            CryptoOperation::KeyDerivation => write!(f, "key derivation"),
             CryptoOperation::KeyExchange => write!(f, "key exchange"),
-            CryptoOperation::Authentication => write!(f, "authentication"),
             CryptoOperation::Handshake => write!(f, "handshake"),
         }
     }
 }
 
-/// Represents security-related errors
+/// Represents cryptographic errors
 #[derive(Debug, Error)]
-pub enum SecurityError {
+pub enum CryptoError {
     #[error("Cryptographic operation failed during {operation}: {details}")]
-    CryptoFailure {
+    OperationFailure {
         operation: CryptoOperation,
         details: String,
     },
@@ -37,17 +35,11 @@ pub enum SecurityError {
     #[error("Authentication failed: {0}")]
     AuthenticationFailure(String),
 
-    #[error("Potential replay attack detected: {0}")]
-    ReplayAttack(String),
-
-    #[error("Sequence number overflow occurred")]
-    SequenceOverflow,
-
     #[error("Invalid key material: {0}")]
     InvalidKeyMaterial(String),
 
-    #[error("Protocol violation: {0}")]
-    ProtocolViolation(String),
+    #[error("Key derivation failed: {0}")]
+    KeyDerivationFailure(String),
 }
 
 /// Represents message format and processing errors
@@ -55,9 +47,6 @@ pub enum SecurityError {
 pub enum MessageError {
     #[error("Message size {size} exceeds maximum allowed size of {max_size}")]
     MessageTooLarge { size: usize, max_size: usize },
-
-    #[error("Invalid packet type identifier: {0}")]
-    InvalidPacketType(u8),
 
     #[error("Message serialization failed: {0}")]
     SerializationFailed(String),
@@ -75,9 +64,6 @@ pub enum StreamError {
     #[error("Invalid stream operation: {0}")]
     InvalidOperation(String),
 
-    #[error("Stream split error: {0}")]
-    SplitError(String),
-
     #[error("Stream closed unexpectedly")]
     UnexpectedClose,
 
@@ -92,7 +78,7 @@ pub enum StreamError {
 #[derive(Debug, Error)]
 pub enum ClavisError {
     #[error(transparent)]
-    Security(#[from] SecurityError),
+    Crypto(#[from] CryptoError),
 
     #[error(transparent)]
     Message(#[from] MessageError),
@@ -108,9 +94,9 @@ pub enum ClavisError {
 }
 
 impl ClavisError {
-    /// Returns true if the error is related to security
-    pub fn is_security_error(&self) -> bool {
-        matches!(self, ClavisError::Security(_))
+    /// Returns true if the error is related to cryptographic operations
+    pub fn is_crypto_error(&self) -> bool {
+        matches!(self, ClavisError::Crypto(_))
     }
 
     /// Returns true if the error is related to message processing
@@ -136,9 +122,9 @@ impl ClavisError {
         }
     }
 
-    /// Creates a new security error for a failed crypto operation
+    /// Creates a new cryptographic error for a failed operation
     pub fn crypto_failure(operation: CryptoOperation, details: impl Into<String>) -> Self {
-        ClavisError::Security(SecurityError::CryptoFailure {
+        ClavisError::Crypto(CryptoError::OperationFailure {
             operation,
             details: details.into(),
         })

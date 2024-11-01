@@ -1,30 +1,21 @@
-use chacha20poly1305::{aead::Aead, KeyInit, XChaCha20Poly1305};
+use chacha20poly1305::{
+    aead::{Aead, AeadCore, KeyInit, OsRng},
+    XChaCha20Poly1305, XNonce,
+};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
-use rand::{RngCore, SeedableRng};
-use rand_chacha::ChaCha20Rng;
+use rand::RngCore;
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use x25519_dalek::{EphemeralSecret, PublicKey};
 
 use crate::{
-    error::{ClavisError, ClavisResult, CryptoOperation, MessageError, SecurityError, StreamError},
+    error::{ClavisError, ClavisResult, CryptoError, CryptoOperation, MessageError, StreamError},
     stream::EncryptedStreamOptions,
 };
 
-struct Sizes {
-    nonce: usize,
-    key: usize,
-    length: usize,
-    mac: usize,
-}
-
-const SIZES: Sizes = Sizes {
-    nonce: 24,
-    key: 32,
-    length: 4,
-    mac: 32,
-};
+type HmacSha256 = Hmac<Sha256>;
 
 struct CryptoContext {
     cipher: XChaCha20Poly1305,
@@ -34,14 +25,13 @@ struct CryptoContext {
 
 impl CryptoContext {
     fn new(key: &[u8], max_message_size: usize) -> ClavisResult<Self> {
-        if key.len() != SIZES.key {
-            return Err(ClavisError::Security(SecurityError::InvalidKeyMaterial(
-                format!("Key must be exactly {} bytes, got {}", SIZES.key, key.len()),
-            )));
-        }
-
         Ok(Self {
-            cipher: XChaCha20Poly1305::new(key.into()),
+            cipher: XChaCha20Poly1305::new_from_slice(key).map_err(|e| {
+                ClavisError::Crypto(CryptoError::InvalidKeyMaterial(format!(
+                    "Invalid key material: {}",
+                    e
+                )))
+            })?,
             buffer: Vec::with_capacity(4096),
             max_message_size,
         })
@@ -50,30 +40,29 @@ impl CryptoContext {
     #[inline]
     fn validate_message_size(&self, size: usize) -> ClavisResult<()> {
         if size > self.max_message_size {
-            return Err(ClavisError::Message(MessageError::MessageTooLarge {
+            Err(ClavisError::Message(MessageError::MessageTooLarge {
                 size,
                 max_size: self.max_message_size,
-            }));
+            }))
+        } else {
+            Ok(())
         }
-        Ok(())
     }
 
-    #[inline]
-    fn calculate_total_len(ciphertext_len: usize) -> usize {
-        SIZES.length + SIZES.nonce + ciphertext_len
-    }
-
-    async fn read_message<R: AsyncRead + Unpin>(&self, stream: &mut R) -> ClavisResult<Vec<u8>> {
-        let length = stream
-            .read_u32_le()
-            .await
-            .map_err(|e| ClavisError::Stream(StreamError::Io(e)))? as usize;
+    async fn read_message<R: AsyncRead + Unpin>(
+        &mut self,
+        stream: &mut R,
+    ) -> ClavisResult<Vec<u8>> {
+        let length = stream.read_u32_le().await.map_err(|e| match e.kind() {
+            std::io::ErrorKind::UnexpectedEof => ClavisError::Stream(StreamError::UnexpectedClose),
+            _ => ClavisError::Stream(StreamError::Io(e)),
+        })? as usize;
 
         self.validate_message_size(length)?;
 
-        let mut buffer = vec![0u8; SIZES.nonce + length];
+        let mut nonce = [0u8; 24];
         stream
-            .read_exact(&mut buffer)
+            .read_exact(&mut nonce)
             .await
             .map_err(|e| match e.kind() {
                 std::io::ErrorKind::UnexpectedEof => {
@@ -82,14 +71,23 @@ impl CryptoContext {
                 _ => ClavisError::Stream(StreamError::Io(e)),
             })?;
 
-        let (nonce, ciphertext) = buffer.split_at(SIZES.nonce);
+        let mut ciphertext = vec![0u8; length];
+        stream
+            .read_exact(&mut ciphertext)
+            .await
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::UnexpectedEof => {
+                    ClavisError::Stream(StreamError::UnexpectedClose)
+                }
+                _ => ClavisError::Stream(StreamError::Io(e)),
+            })?;
 
-        self.cipher.decrypt(nonce.into(), ciphertext).map_err(|e| {
-            ClavisError::crypto_failure(
-                CryptoOperation::Decryption,
-                format!("Failed to decrypt message: {}", e),
-            )
-        })
+        let plaintext = self
+            .cipher
+            .decrypt(XNonce::from_slice(&nonce), ciphertext.as_ref())
+            .map_err(|e| ClavisError::crypto_failure(CryptoOperation::Decryption, e.to_string()))?;
+
+        Ok(plaintext)
     }
 
     async fn write_message<W: AsyncWrite + Unpin>(
@@ -99,20 +97,14 @@ impl CryptoContext {
     ) -> ClavisResult<()> {
         self.validate_message_size(message.len())?;
 
-        let nonce = generate_random_bytes::<{ SIZES.nonce }>();
+        let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+
         let ciphertext = self
             .cipher
-            .encrypt(nonce.as_slice().into(), message)
-            .map_err(|e| {
-                ClavisError::crypto_failure(
-                    CryptoOperation::Encryption,
-                    format!("Failed to encrypt message: {}", e),
-                )
-            })?;
+            .encrypt(&nonce, message)
+            .map_err(|e| ClavisError::crypto_failure(CryptoOperation::Encryption, e.to_string()))?;
 
         self.buffer.clear();
-        self.buffer
-            .reserve(Self::calculate_total_len(ciphertext.len()));
         self.buffer
             .extend_from_slice(&(ciphertext.len() as u32).to_le_bytes());
         self.buffer.extend_from_slice(&nonce);
@@ -126,265 +118,280 @@ impl CryptoContext {
             .flush()
             .await
             .map_err(|e| ClavisError::Stream(StreamError::Io(e)))?;
+
         Ok(())
     }
 }
 
 struct HandshakeContext {
-    transcript: Vec<u8>,
-    hmac: Option<Hmac<Sha256>>,
+    transcript: Sha256,
+    mac: Option<HmacSha256>,
 }
 
 impl HandshakeContext {
     fn new(psk: Option<&[u8]>) -> ClavisResult<Self> {
+        let mac = psk
+            .map(<HmacSha256 as KeyInit>::new_from_slice)
+            .transpose()
+            .map_err(|e| {
+                ClavisError::crypto_failure(
+                    CryptoOperation::Authentication,
+                    format!("Failed to create HMAC: {}", e),
+                )
+            })?;
+
         Ok(Self {
-            transcript: Vec::with_capacity(SIZES.key * 4),
-            hmac: psk
-                .map(|key| {
-                    KeyInit::new_from_slice(key).map_err(|e| {
-                        ClavisError::crypto_failure(
-                            CryptoOperation::Authentication,
-                            format!("Failed to create HMAC: {}", e),
-                        )
-                    })
-                })
-                .transpose()?,
+            transcript: Sha256::new(),
+            mac,
         })
     }
 
-    #[inline]
     fn append(&mut self, data: &[u8]) {
-        self.transcript.extend_from_slice(data);
-        if let Some(hmac) = &mut self.hmac {
-            Mac::update(hmac, data);
+        self.transcript.update(data);
+        if let Some(mac) = &mut self.mac {
+            mac.update(data);
         }
     }
 
-    fn finalize(self) -> ([u8; SIZES.key], Option<[u8; SIZES.mac]>) {
-        let transcript_hash = Sha256::digest(&self.transcript).into();
-        let mac = self.hmac.map(|mac| Mac::finalize(mac).into_bytes().into());
+    fn finalize(self) -> ([u8; 32], Option<[u8; 32]>) {
+        let transcript_hash = self.transcript.finalize().into();
+        let mac = self.mac.map(|mac| mac.finalize().into_bytes().into());
         (transcript_hash, mac)
     }
 }
 
-#[inline]
-fn generate_random_bytes<const N: usize>() -> [u8; N] {
-    let mut bytes = [0u8; N];
-    let mut rng = ChaCha20Rng::from_entropy();
-    rng.fill_bytes(&mut bytes);
-    bytes
+pub struct CryptoReader {
+    context: CryptoContext,
 }
 
-pub struct CryptoReader(CryptoContext);
-pub struct CryptoWriter(CryptoContext);
-
 impl CryptoReader {
-    #[inline]
-    pub async fn read<R: AsyncRead + Unpin>(&self, stream: &mut R) -> ClavisResult<Vec<u8>> {
-        self.0.read_message(stream).await
+    pub async fn read<R: AsyncRead + Unpin + Send>(
+        &mut self,
+        stream: &mut R,
+    ) -> ClavisResult<Vec<u8>> {
+        self.context.read_message(stream).await
     }
 }
 
+pub struct CryptoWriter {
+    context: CryptoContext,
+}
+
 impl CryptoWriter {
-    #[inline]
-    pub async fn write<W: AsyncWrite + Unpin>(
+    pub async fn write<W: AsyncWrite + Unpin + Send>(
         &mut self,
         stream: &mut W,
         message: &[u8],
     ) -> ClavisResult<()> {
-        self.0.write_message(stream, message).await
+        self.context.write_message(stream, message).await
     }
 }
 
 pub struct CryptoCore {
-    reader: CryptoContext,
-    writer: CryptoContext,
+    pub(crate) reader: CryptoReader,
+    pub(crate) writer: CryptoWriter,
 }
 
 impl CryptoCore {
-    pub async fn establish<S>(stream: &mut S, options: EncryptedStreamOptions) -> ClavisResult<Self>
-    where
-        S: AsyncRead + AsyncWrite + Unpin + Send,
-    {
-        if let Some(psk) = options.psk.as_ref() {
-            if psk.len() < 16 {
-                return Err(ClavisError::Security(SecurityError::InvalidKeyMaterial(
-                    "Pre-shared key must be at least 16 bytes long".into(),
-                )));
-            }
-        }
+    pub async fn establish<S: AsyncRead + AsyncWrite + Unpin + Send>(
+        stream: &mut S,
+        options: EncryptedStreamOptions,
+    ) -> ClavisResult<Self> {
+        let is_initiator = Self::determine_role(stream).await?;
+        Self::validate_psk(&options)?;
 
-        let (secret, transcript_hash, mac, is_initiator) =
-            Self::handshake(stream, options.psk.as_deref()).await?;
-
-        if let Some(local_mac) = mac {
-            let mut peer_mac = [0u8; SIZES.mac];
-
-            match is_initiator {
-                true => {
-                    stream
-                        .write_all(&local_mac)
-                        .await
-                        .map_err(|e| ClavisError::Stream(StreamError::Io(e)))?;
-                    stream
-                        .read_exact(&mut peer_mac)
-                        .await
-                        .map_err(|e| ClavisError::Stream(StreamError::Io(e)))?;
-                }
-                false => {
-                    stream
-                        .read_exact(&mut peer_mac)
-                        .await
-                        .map_err(|e| ClavisError::Stream(StreamError::Io(e)))?;
-                    stream
-                        .write_all(&local_mac)
-                        .await
-                        .map_err(|e| ClavisError::Stream(StreamError::Io(e)))?;
-                }
-            }
-
-            if peer_mac != local_mac {
-                return Err(ClavisError::Security(SecurityError::AuthenticationFailure(
-                    "MAC verification failed during handshake".into(),
-                )));
-            }
-        }
-
-        let (enc_key, dec_key) = Self::derive_keys(&secret, is_initiator, &transcript_hash)?;
+        let (shared_secret, transcript_hash, mac) =
+            Self::handshake(stream, options.psk.as_deref(), is_initiator).await?;
+        Self::verify_mac(stream, mac, is_initiator).await?;
+        let (enc_key, dec_key) = Self::derive_keys(&shared_secret, &transcript_hash, is_initiator)?;
 
         Ok(Self {
-            reader: CryptoContext::new(&dec_key, options.max_packet_size)?,
-            writer: CryptoContext::new(&enc_key, options.max_packet_size)?,
+            reader: CryptoReader {
+                context: CryptoContext::new(&dec_key, options.max_packet_size)?,
+            },
+            writer: CryptoWriter {
+                context: CryptoContext::new(&enc_key, options.max_packet_size)?,
+            },
         })
     }
 
-    async fn handshake<S>(
+    async fn determine_role<S: AsyncRead + AsyncWrite + Unpin>(
         stream: &mut S,
-        psk: Option<&[u8]>,
-    ) -> ClavisResult<(
-        [u8; SIZES.key],
-        [u8; SIZES.key],
-        Option<[u8; SIZES.mac]>,
-        bool,
-    )>
-    where
-        S: AsyncRead + AsyncWrite + Unpin + Send,
-    {
-        let mut context = HandshakeContext::new(psk)?;
-        let local_nonce = generate_random_bytes::<{ SIZES.key }>();
-        let mut peer_nonce = [0u8; SIZES.key];
+    ) -> ClavisResult<bool> {
+        let mut local_nonce = [0u8; 32];
+        OsRng.fill_bytes(&mut local_nonce);
 
         stream
             .write_all(&local_nonce)
             .await
             .map_err(|e| ClavisError::Stream(StreamError::Io(e)))?;
         stream
+            .flush()
+            .await
+            .map_err(|e| ClavisError::Stream(StreamError::Io(e)))?;
+
+        let mut peer_nonce = [0u8; 32];
+        stream
             .read_exact(&mut peer_nonce)
             .await
             .map_err(|e| ClavisError::Stream(StreamError::Io(e)))?;
 
-        let is_initiator = local_nonce < peer_nonce;
-        let (first, second) = if is_initiator {
-            (&local_nonce, &peer_nonce)
-        } else {
-            (&peer_nonce, &local_nonce)
-        };
+        Ok(local_nonce > peer_nonce)
+    }
 
-        context.append(first);
-        context.append(second);
+    fn validate_psk(options: &EncryptedStreamOptions) -> ClavisResult<()> {
+        if let Some(psk) = &options.psk {
+            if psk.len() < 16 {
+                return Err(ClavisError::Crypto(CryptoError::InvalidKeyMaterial(
+                    "Pre-shared key must be at least 16 bytes".into(),
+                )));
+            }
+        }
+        Ok(())
+    }
 
-        let (secret, peer_key) = if is_initiator {
-            Self::exchange_keys_initiator(stream, &mut context).await?
-        } else {
-            Self::exchange_keys_responder(stream, &mut context).await?
-        };
+    async fn verify_mac<S: AsyncRead + AsyncWrite + Unpin>(
+        stream: &mut S,
+        mac: Option<[u8; 32]>,
+        is_initiator: bool,
+    ) -> ClavisResult<()> {
+        if let Some(local_mac) = mac {
+            let mut peer_mac = [0u8; 32];
 
-        let shared_secret = *secret.diffie_hellman(&peer_key).as_bytes();
+            if is_initiator {
+                stream
+                    .write_all(&local_mac)
+                    .await
+                    .map_err(|e| ClavisError::Stream(StreamError::Io(e)))?;
+                stream
+                    .flush()
+                    .await
+                    .map_err(|e| ClavisError::Stream(StreamError::Io(e)))?;
+                stream
+                    .read_exact(&mut peer_mac)
+                    .await
+                    .map_err(|e| ClavisError::Stream(StreamError::Io(e)))?;
+            } else {
+                stream
+                    .read_exact(&mut peer_mac)
+                    .await
+                    .map_err(|e| ClavisError::Stream(StreamError::Io(e)))?;
+                stream
+                    .write_all(&local_mac)
+                    .await
+                    .map_err(|e| ClavisError::Stream(StreamError::Io(e)))?;
+                stream
+                    .flush()
+                    .await
+                    .map_err(|e| ClavisError::Stream(StreamError::Io(e)))?;
+            }
+
+            if local_mac.ct_eq(&peer_mac).unwrap_u8() == 0 {
+                return Err(ClavisError::Crypto(CryptoError::AuthenticationFailure(
+                    "MAC verification failed".into(),
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    async fn handshake<S: AsyncRead + AsyncWrite + Unpin + Send>(
+        stream: &mut S,
+        psk: Option<&[u8]>,
+        is_initiator: bool,
+    ) -> ClavisResult<([u8; 32], [u8; 32], Option<[u8; 32]>)> {
+        let mut context = HandshakeContext::new(psk)?;
+        let (secret, peer_key) = Self::exchange_keys(stream, &mut context, is_initiator).await?;
+
+        let shared_secret = secret.diffie_hellman(&peer_key);
+        let shared_secret_bytes = shared_secret.as_bytes();
         let (transcript_hash, mac) = context.finalize();
 
-        Ok((shared_secret, transcript_hash, mac, is_initiator))
+        Ok((*shared_secret_bytes, transcript_hash, mac))
     }
 
-    async fn exchange_keys_initiator<S>(
+    async fn exchange_keys<S: AsyncRead + AsyncWrite + Unpin + Send>(
         stream: &mut S,
         context: &mut HandshakeContext,
-    ) -> ClavisResult<(EphemeralSecret, PublicKey)>
-    where
-        S: AsyncRead + AsyncWrite + Unpin + Send,
-    {
-        let mut rng = ChaCha20Rng::from_entropy();
-        let secret = EphemeralSecret::random_from_rng(&mut rng);
+        is_initiator: bool,
+    ) -> ClavisResult<(EphemeralSecret, PublicKey)> {
+        let secret = EphemeralSecret::random_from_rng(OsRng);
         let public = PublicKey::from(&secret);
+        let mut peer_bytes = [0u8; 32];
 
-        stream
-            .write_all(public.as_bytes())
-            .await
-            .map_err(|e| ClavisError::Stream(StreamError::Io(e)))?;
-        context.append(public.as_bytes());
+        if is_initiator {
+            stream
+                .write_all(public.as_bytes())
+                .await
+                .map_err(|e| ClavisError::Stream(StreamError::Io(e)))?;
+            stream
+                .flush()
+                .await
+                .map_err(|e| ClavisError::Stream(StreamError::Io(e)))?;
+            stream
+                .read_exact(&mut peer_bytes)
+                .await
+                .map_err(|e| ClavisError::Stream(StreamError::Io(e)))?;
+        } else {
+            stream
+                .read_exact(&mut peer_bytes)
+                .await
+                .map_err(|e| ClavisError::Stream(StreamError::Io(e)))?;
+            stream
+                .write_all(public.as_bytes())
+                .await
+                .map_err(|e| ClavisError::Stream(StreamError::Io(e)))?;
+            stream
+                .flush()
+                .await
+                .map_err(|e| ClavisError::Stream(StreamError::Io(e)))?;
+        }
 
-        let mut peer_bytes = [0u8; SIZES.key];
-        stream
-            .read_exact(&mut peer_bytes)
-            .await
-            .map_err(|e| ClavisError::Stream(StreamError::Io(e)))?;
-        context.append(&peer_bytes);
+        if is_initiator {
+            context.append(public.as_bytes());
+            context.append(&peer_bytes);
+        } else {
+            context.append(&peer_bytes);
+            context.append(public.as_bytes());
+        }
 
-        Ok((secret, PublicKey::from(peer_bytes)))
-    }
-
-    async fn exchange_keys_responder<S>(
-        stream: &mut S,
-        context: &mut HandshakeContext,
-    ) -> ClavisResult<(EphemeralSecret, PublicKey)>
-    where
-        S: AsyncRead + AsyncWrite + Unpin + Send,
-    {
-        let mut peer_bytes = [0u8; SIZES.key];
-        stream
-            .read_exact(&mut peer_bytes)
-            .await
-            .map_err(|e| ClavisError::Stream(StreamError::Io(e)))?;
-        context.append(&peer_bytes);
-
-        let mut rng = ChaCha20Rng::from_entropy();
-        let secret = EphemeralSecret::random_from_rng(&mut rng);
-        let public = PublicKey::from(&secret);
-
-        stream
-            .write_all(public.as_bytes())
-            .await
-            .map_err(|e| ClavisError::Stream(StreamError::Io(e)))?;
-        context.append(public.as_bytes());
-
-        Ok((secret, PublicKey::from(peer_bytes)))
+        let peer_key = PublicKey::from(peer_bytes);
+        Ok((secret, peer_key))
     }
 
     fn derive_keys(
-        shared: &[u8],
+        shared_secret: &[u8; 32],
+        transcript_hash: &[u8; 32],
         is_initiator: bool,
-        transcript_hash: &[u8; SIZES.key],
-    ) -> ClavisResult<([u8; SIZES.key], [u8; SIZES.key])> {
-        let hkdf = Hkdf::<Sha256>::new(Some(transcript_hash), shared);
-        let mut initiator_key = [0u8; SIZES.key];
-        let mut responder_key = [0u8; SIZES.key];
+    ) -> ClavisResult<([u8; 32], [u8; 32])> {
+        let hkdf = Hkdf::<Sha256>::new(Some(transcript_hash), shared_secret);
+        let mut enc_key = [0u8; 32];
+        let mut dec_key = [0u8; 32];
 
-        hkdf.expand(b"initiator", &mut initiator_key)
-            .and_then(|_| hkdf.expand(b"responder", &mut responder_key))
-            .map_err(|e| {
-                ClavisError::crypto_failure(
-                    CryptoOperation::KeyDerivation,
-                    format!("HKDF expansion failed: {}", e),
-                )
+        if is_initiator {
+            hkdf.expand(b"enc", &mut enc_key).map_err(|_| {
+                ClavisError::Crypto(CryptoError::KeyDerivationFailure(
+                    "Failed to derive encryption key".into(),
+                ))
             })?;
-
-        Ok(if is_initiator {
-            (initiator_key, responder_key)
+            hkdf.expand(b"dec", &mut dec_key).map_err(|_| {
+                ClavisError::Crypto(CryptoError::KeyDerivationFailure(
+                    "Failed to derive decryption key".into(),
+                ))
+            })?;
         } else {
-            (responder_key, initiator_key)
-        })
-    }
+            hkdf.expand(b"dec", &mut enc_key).map_err(|_| {
+                ClavisError::Crypto(CryptoError::KeyDerivationFailure(
+                    "Failed to derive encryption key".into(),
+                ))
+            })?;
+            hkdf.expand(b"enc", &mut dec_key).map_err(|_| {
+                ClavisError::Crypto(CryptoError::KeyDerivationFailure(
+                    "Failed to derive decryption key".into(),
+                ))
+            })?;
+        }
 
-    pub fn split(self) -> (CryptoReader, CryptoWriter) {
-        (CryptoReader(self.reader), CryptoWriter(self.writer))
+        Ok((enc_key, dec_key))
     }
 }

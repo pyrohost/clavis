@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 //! Clavis is a robust, asynchronous Rust library for establishing secure, encrypted
-//! communication channels over network streams. Built on tokio, it provides high-level
+//! communication channels over network streams. Built on Tokio, it provides high-level
 //! abstractions for encrypted packet-based communication while maintaining strong security
 //! guarantees through modern cryptographic primitives.
 //!
@@ -46,15 +46,14 @@
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     let stream = TcpStream::connect("127.0.0.1:7272").await?;
-//!     let encrypted = EncryptedStream::new(stream, None).await?;
-//!     let (mut reader, mut writer) = encrypted.split()?;
+//!     let mut encrypted = EncryptedStream::new(stream, None).await?;
 //!
 //!     let ping = Message::Ping(PingPongData {
 //!         message: "Hello!".into(),
 //!     });
-//!     writer.write_packet(&ping).await?;
-//!     
-//!     if let Message::Pong(pong) = reader.read_packet().await? {
+//!     encrypted.write_packet(&ping).await?;
+//!
+//!     if let Message::Pong(pong) = encrypted.read_packet().await? {
 //!         println!("Received pong: {:?}", pong);
 //!     }
 //!
@@ -87,8 +86,8 @@ pub mod prelude {
     pub use {bincode, serde};
 }
 
-pub use error::*;
-pub use stream::{EncryptedPacket, EncryptedStream, EncryptedStreamOptions};
+pub use crate::error::*;
+pub use crate::stream::{EncryptedPacket, EncryptedStream, EncryptedStreamOptions};
 
 pub trait PacketTrait: Send + Sync + Sized {
     fn serialize(&self) -> ClavisResult<Vec<u8>>;

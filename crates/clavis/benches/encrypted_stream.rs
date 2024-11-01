@@ -2,7 +2,7 @@ use clavis::{
     protocol, ClavisResult, EncryptedPacket, EncryptedStream, EncryptedStreamOptions, PacketTrait,
 };
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use tokio::{io::DuplexStream, runtime::Runtime};
+use tokio::io::DuplexStream;
 
 const BUFFER_SIZES: &[usize] = &[1024, 4096, 16384, 65536];
 const TEST_PSK: &[u8; 32] = b"benchmark_test_key_32_bytes_long";
@@ -38,11 +38,14 @@ async fn setup_streams(
 }
 
 fn run_benchmarks(c: &mut Criterion) {
-    let rt = Runtime::new().unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
 
-    // Stream benchmarks
+    // Key exchange benchmarks
     {
-        let mut group = c.benchmark_group("encrypted_stream");
+        let mut group = c.benchmark_group("key_exchange");
         for &size in BUFFER_SIZES {
             group.throughput(Throughput::Bytes(size as u64));
 
@@ -57,6 +60,15 @@ fn run_benchmarks(c: &mut Criterion) {
                 b.to_async(&rt)
                     .iter(|| async { setup_streams(size, true).await });
             });
+        }
+        group.finish();
+    }
+
+    // Stream benchmarks
+    {
+        let mut group = c.benchmark_group("encrypted_stream");
+        for &size in BUFFER_SIZES {
+            group.throughput(Throughput::Bytes(size as u64));
 
             // Benchmark packet sending without PSK
             group.bench_function(BenchmarkId::new("packet_send_no_psk", size), |b| {

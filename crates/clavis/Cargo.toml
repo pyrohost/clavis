@@ -1,13 +1,19 @@
 [package]
 name = "clavis"
-version = "0.1.1-rc6"
+version = "0.1.1-rc7"
 edition = "2021"
 authors = ["Pyro Host Inc. <team@pyro.host>"]
-description = "A robust, asynchronous Rust library for establishing secure, encrypted communication channels over network streams"
+description = "High-performance async network encryption library featuring XChaCha20-Poly1305, type-safe protocol DSL, and zero-copy packet streaming for secure communication channels"
 repository = "https://github.com/pyrohost/clavis"
 license = "MIT"
-keywords = ["crypto", "network", "async", "encryption", "security"]
-categories = ["cryptography", "network-programming", "asynchronous"]
+keywords = ["encryption", "networking", "async-stream", "xchacha20", "protocol"]
+categories = [
+    "cryptography",
+    "network-programming",
+    "asynchronous",
+    "encoding",
+    "parsing",
+]
 readme = "../../README.md"
 
 [dependencies]
@@ -17,11 +23,11 @@ tokio = { version = "1.0", features = ["full"] }
 # Cryptography
 chacha20poly1305 = { version = "0.10" }
 x25519-dalek = { version = "2.0" }
-rand = "0.8"
-rand_chacha = "0.3"
+rand = { version = "0.8", features = ["std", "getrandom"] }
 sha2 = "0.10"
 hkdf = "0.12"
 hmac = "0.12"
+subtle = "2.6.1"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -32,10 +38,9 @@ thiserror = "1.0"
 anyhow = "1.0"
 
 # Logging
-tracing = "0.1"
+tracing = { version = "0.1", features = ["attributes"] }
 
 [dev-dependencies]
-tracing-subscriber = "0.3"
 criterion = { version = "0.5", features = ["async_tokio", "html_reports"] }
 
 [profile.release]
@@ -43,6 +48,8 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+opt-level = 3
+debug = false
 
 [[bench]]
 name = "encrypted_stream"

@@ -70,7 +70,9 @@ where
                 ClavisError::crypto_failure(crate::error::CryptoOperation::Handshake, e.to_string())
             })?;
 
-        let (crypto_reader, crypto_writer) = core.split();
+        let crypto_reader = core.reader;
+        let crypto_writer = core.writer;
+
         Ok(Self {
             stream,
             crypto_reader,
