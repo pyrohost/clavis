@@ -43,14 +43,6 @@ tracing = { version = "0.1", features = ["attributes"] }
 [dev-dependencies]
 criterion = { version = "0.5", features = ["async_tokio", "html_reports"] }
 
-[profile.release]
-lto = true
-codegen-units = 1
-panic = "abort"
-strip = true
-opt-level = 3
-debug = false
-
 [[bench]]
 name = "encrypted_stream"
 harness = false
