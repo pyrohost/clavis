@@ -82,14 +82,12 @@ where
     }
 
     /// Splits the stream into separate reader and writer components
-    pub fn split(
-        self,
-    ) -> ClavisResult<(EncryptedReader<ReadHalf<S>>, EncryptedWriter<WriteHalf<S>>)> {
+    pub fn split(self) -> (EncryptedReader<ReadHalf<S>>, EncryptedWriter<WriteHalf<S>>) {
         let (read, write) = tokio::io::split(self.stream);
-        Ok((
+        (
             EncryptedReader::new(read, self.crypto_reader, self.options.clone()),
             EncryptedWriter::new(write, self.crypto_writer, self.options),
-        ))
+        )
     }
 }
 
