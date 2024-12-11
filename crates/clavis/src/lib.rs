@@ -110,7 +110,7 @@ macro_rules! protocol {
         )*
     ) => {
         $(
-            #[derive(Debug, Clone, PartialEq, Eq, $crate::prelude::serde::Serialize, $crate::prelude::serde::Deserialize)]
+            #[derive($crate::prelude::serde::Serialize, $crate::prelude::serde::Deserialize)]
             $(#[$enum_meta])*
             $enum_vis enum $enum_name {
                 $(
