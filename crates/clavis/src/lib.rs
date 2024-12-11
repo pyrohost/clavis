@@ -104,7 +104,7 @@ macro_rules! protocol {
                     $(#[$variant_meta:meta])*
                     $variant_vis:vis $variant:ident
                     $(($inner:ty))?
-                    $({ $( $field_vis:vis $field:ident : $ftype:ty ),+ $(,)? })?
+                    $({ $( $field:ident : $ftype:ty ),* $(,)? })?
                 ),* $(,)?
             }
         )*
@@ -117,7 +117,7 @@ macro_rules! protocol {
                     $(#[$variant_meta])*
                     $variant_vis $variant
                     $(($inner))?
-                    $({ $( $field_vis $field : $ftype ),+ })?,
+                    $({ $( $field : $ftype ),* })?,
                 )*
             }
 
@@ -146,4 +146,12 @@ macro_rules! protocol {
             }
         )*
     };
+}
+
+protocol! {
+    #[derive(Debug)]
+    pub enum Test {
+        Variant {
+        }
+    }
 }
