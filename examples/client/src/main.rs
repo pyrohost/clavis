@@ -14,13 +14,7 @@ async fn main() -> anyhow::Result<()> {
     info!("Connected to server");
 
     let encrypted_stream = EncryptedStream::new(stream, None).await?;
-    let (mut reader, mut writer) = match encrypted_stream.split() {
-        Ok(split) => split,
-        Err(e) => {
-            error!("Failed to split encrypted stream: {:?}", e);
-            return Err(e.into());
-        }
-    };
+    let (mut reader, mut writer) = encrypted_stream.split();
 
     for i in 1..=5 {
         let ping = Packet::Ping(PingPongData {

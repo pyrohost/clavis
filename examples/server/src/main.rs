@@ -32,13 +32,7 @@ async fn main() -> anyhow::Result<()> {
 
 async fn handle_client(stream: tokio::net::TcpStream) -> anyhow::Result<()> {
     let encrypted_stream = EncryptedStream::new(stream, None).await?;
-    let (mut reader, mut writer) = match encrypted_stream.split() {
-        Ok(split) => split,
-        Err(e) => {
-            error!("Failed to split encrypted stream: {:?}", e);
-            return Err(e.into());
-        }
-    };
+    let (mut reader, mut writer) = encrypted_stream.split();
 
     loop {
         match timeout(Duration::from_secs(30), reader.read_packet()).await {
