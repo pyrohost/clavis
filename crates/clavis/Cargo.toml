@@ -1,6 +1,6 @@
 [package]
 name = "clavis"
-version = "0.1.1-rc7"
+version = "0.1.1-rc8"
 edition = "2021"
 authors = ["Pyro Host Inc. <team@pyro.host>"]
 description = "High-performance async network encryption library featuring XChaCha20-Poly1305, type-safe protocol DSL, and zero-copy packet streaming for secure communication channels"
