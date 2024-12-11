@@ -148,10 +148,3 @@ macro_rules! protocol {
     };
 }
 
-protocol! {
-    #[derive(Debug)]
-    pub enum Test {
-        Variant {
-        }
-    }
-}
