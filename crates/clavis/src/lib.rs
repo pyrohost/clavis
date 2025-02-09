@@ -97,60 +97,174 @@ pub trait PacketTrait: Send + Sync + Sized {
 #[macro_export]
 macro_rules! protocol {
     (
-        $(
-            $(#[$enum_meta:meta])*
-            $enum_vis:vis enum $enum_name:ident {
-                $(
-                    $(#[$variant_meta:meta])*
-                    $variant:ident
-                    $(($inner:ty))?
-                    $({ $(
-                        $(#[$field_meta:meta])*
-                        $field:ident : $ftype:ty
-                    ),* $(,)? })?
-                ),* $(,)?
-            }
-        )*
+        $(#[$meta_root:meta])*
+        $vis:vis enum $name:ident {
+            $($contents:tt)*
+        }
     ) => {
-        $(
-            #[derive($crate::prelude::serde::Serialize, $crate::prelude::serde::Deserialize)]
-            $(#[$enum_meta])*
-            $enum_vis enum $enum_name {
-                $(
-                    $(#[$variant_meta])*
-                    $variant
-                    $(($inner))?
-                    $({ $(
-                        $(#[$field_meta])*
-                        $field : $ftype
-                    ),* })?,
-                )*
-            }
-
-            impl $crate::PacketTrait for $enum_name {
-                fn serialize(&self) -> $crate::ClavisResult<Vec<u8>> {
-                    $crate::prelude::bincode::serialize(self)
-                        .map_err(|e| $crate::ClavisError::serialization_failed(format!(
-                            "Failed to serialize {}: {}", stringify!($enum_name), e
-                        )))
-                }
-
-                fn deserialize(data: &[u8]) -> $crate::ClavisResult<Self> {
-                    use $crate::MessageError;
-
-                    if data.is_empty() {
-                        return Err($crate::ClavisError::Message(
-                            MessageError::InvalidFormat("Empty packet data".into())
-                        ));
-                    }
-
-                    $crate::prelude::bincode::deserialize(data)
-                        .map_err(|e| $crate::ClavisError::deserialization_failed(format!(
-                            "Failed to deserialize {}: {}", stringify!($enum_name), e
-                        )))
-                }
-            }
-        )*
+        protocol! {
+        @subparser
+        {
+            $(#[$meta_root])*
+        },
+        ($vis, $name),
+        {},
+        $($contents)*
+        }
     };
+
+    (
+    @subparser
+    {
+        $(#[$meta_root:meta])*
+    },
+    ($vis:vis, $name:ident),
+    { $($acc:tt)* },
+    ) => {
+        #[derive($crate::prelude::serde::Serialize, $crate::prelude::serde::Deserialize)]
+        $(#[$meta_root])*
+        $vis enum $name {
+            $($acc)*
+        }
+
+        impl $crate::PacketTrait for $name {
+            fn serialize(&self) -> $crate::ClavisResult<std::vec::Vec<u8>> {
+                $crate::prelude::bincode::serialize(self)
+                    .map_err(|e| $crate::ClavisError::serialization_failed(::std::format!(
+                        "Failed to serialize {}: {}", stringify!($enum_name), e
+                    )))
+            }
+
+            fn deserialize(data: &[u8]) -> $crate::ClavisResult<Self> {
+                use $crate::MessageError;
+
+                if data.is_empty() {
+                    return std::result::Result::Err($crate::ClavisError::Message(
+                        MessageError::InvalidFormat("Empty packet data".into())
+                    ));
+                }
+
+                $crate::prelude::bincode::deserialize(data)
+                    .map_err(|e| $crate::ClavisError::deserialization_failed(::std::format!(
+                        "Failed to deserialize {}: {}", stringify!($enum_name), e
+                    )))
+            }
+        }
+    };
+
+    (
+    @subparser
+    {
+        $(#[$meta_root:meta])*
+    },
+    ($vis:vis, $name:ident),
+    { $($acc:tt)* },
+    $(#[$vmeta:meta])*
+    $v:ident,
+    $($tail:tt)*
+    ) => {
+        protocol! {
+        @subparser
+        {
+            $(#[$meta_root])*
+        },
+        ($vis, $name),
+        {
+            $($acc)*
+            $(#[$vmeta])*
+            $v,
+        },
+        $($tail)*
+        }
+    };
+
+    (
+    @subparser
+    {
+        $(#[$meta_root:meta])*
+    },
+    ($vis:vis, $name:ident),
+    { $($acc:tt)* },
+    $(#[$vmeta:meta])*
+    $v:ident {
+        $(
+            $(#[$fmeta:meta])*
+            $field:ident : $fty:ty
+        ),* $(,)?
+    } $(,)?
+    $($tail:tt)*
+    ) => {
+        protocol! {
+        @subparser
+        {
+            $(#[$meta_root])*
+        },
+        ($vis, $name),
+        {
+            $($acc)*
+            $(#[$vmeta])*
+            $v {
+                $(
+                    $(#[$fmeta])*
+                    $field : $fty
+                ),*
+            },
+        },
+        $($tail)*
+        }
+    };
+
+    (
+    @subparser
+    {
+        $(#[$meta_root:meta])*
+    },
+    ($vis:vis, $name:ident),
+    { $($acc:tt)* },
+    $(#[$vmeta:meta])*
+    $v:ident (
+        $( $(#[$tmeta:meta])* $sty:ty),+ $(,)?
+    ),
+    $($tail:tt)*
+    ) => {
+        protocol! {
+        @subparser
+        {
+            $(#[$meta_root])*
+        },
+        ($vis, $name),
+        {
+            $($acc)*
+            $(#[$vmeta])*
+            $v (
+                $(
+                    $(#[$tmeta])*
+                    $sty
+                ),+
+            ),
+        },
+        $($tail)*
+        }
+    };
+}
+
+protocol! {
+    #[derive(Default)]
+    pub enum Test {
+        /// Doc comment
+        #[default]
+        Default,
+
+        Variant(#[doc = "hello"] String),
+        /// Doc comment 2
+        Variant2(#[doc = "hello 2"] u32, u32),
+
+        Variant3 {
+            field: Vec<u32>,
+            field2: String,
+            /// Docs
+            field3: i32,
+        }
+    }
 }
 
