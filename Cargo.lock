@@ -218,7 +218,7 @@ checksum = "1462739cb27611015575c0c11df5df7601141071f07518d56fcc1be504cbec97"
 
 [[package]]
 name = "clavis"
-version = "0.1.1-rc9"
+version = "0.1.1-rc10"
 dependencies = [
  "anyhow",
  "bincode",
