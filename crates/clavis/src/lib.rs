@@ -96,6 +96,7 @@ pub trait PacketTrait: Send + Sync + Sized {
 
 #[macro_export]
 macro_rules! protocol {
+    // Entrypoint
     (
         $(#[$meta_root:meta])*
         $vis:vis enum $name:ident {
@@ -113,6 +114,7 @@ macro_rules! protocol {
         }
     };
 
+    // Stop case
     (
     @subparser
     {
@@ -152,6 +154,31 @@ macro_rules! protocol {
         }
     };
 
+    // Trailing comma case filter
+    (
+    @subparser
+    {
+        $(#[$meta_root:meta])*
+    },
+    ($vis:vis, $name:ident),
+    { $($acc:tt)* },
+    ,
+    $($tail:tt)*
+    ) => {
+        protocol! {
+        @subparser
+        {
+            $(#[$meta_root])*
+        },
+        ($vis, $name),
+        {
+            $($acc)*
+        },
+        $($tail)*
+        }
+    };
+
+    // Unit variant case
     (
     @subparser
     {
@@ -178,6 +205,7 @@ macro_rules! protocol {
         }
     };
 
+    // Struct variant case
     (
     @subparser
     {
@@ -191,7 +219,7 @@ macro_rules! protocol {
             $(#[$fmeta:meta])*
             $field:ident : $fty:ty
         ),* $(,)?
-    } $(,)?
+    }
     $($tail:tt)*
     ) => {
         protocol! {
@@ -214,6 +242,7 @@ macro_rules! protocol {
         }
     };
 
+    // Tuple variant case
     (
     @subparser
     {
@@ -224,7 +253,7 @@ macro_rules! protocol {
     $(#[$vmeta:meta])*
     $v:ident (
         $( $(#[$tmeta:meta])* $sty:ty),+ $(,)?
-    ),
+    )
     $($tail:tt)*
     ) => {
         protocol! {
@@ -246,25 +275,5 @@ macro_rules! protocol {
         $($tail)*
         }
     };
-}
-
-protocol! {
-    #[derive(Default)]
-    pub enum Test {
-        /// Doc comment
-        #[default]
-        Default,
-
-        Variant(#[doc = "hello"] String),
-        /// Doc comment 2
-        Variant2(#[doc = "hello 2"] u32, u32),
-
-        Variant3 {
-            field: Vec<u32>,
-            field2: String,
-            /// Docs
-            field3: i32,
-        }
-    }
 }
 
