@@ -102,9 +102,12 @@ macro_rules! protocol {
             $enum_vis:vis enum $enum_name:ident {
                 $(
                     $(#[$variant_meta:meta])*
-                    $variant_vis:vis $variant:ident
+                    $variant:ident
                     $(($inner:ty))?
-                    $({ $( $field:ident : $ftype:ty ),* $(,)? })?
+                    $({ $(
+                        $(#[$field_meta:meta])*
+                        $field:ident : $ftype:ty
+                    ),* $(,)? })?
                 ),* $(,)?
             }
         )*
@@ -115,9 +118,12 @@ macro_rules! protocol {
             $enum_vis enum $enum_name {
                 $(
                     $(#[$variant_meta])*
-                    $variant_vis $variant
+                    $variant
                     $(($inner))?
-                    $({ $( $field : $ftype ),* })?,
+                    $({ $(
+                        $(#[$field_meta])*
+                        $field : $ftype
+                    ),* })?,
                 )*
             }
 
