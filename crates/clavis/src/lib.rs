@@ -87,7 +87,7 @@ pub mod prelude {
 }
 
 pub use crate::error::*;
-pub use crate::stream::{EncryptedPacket, EncryptedStream, EncryptedStreamOptions};
+pub use crate::stream::{EncryptedPacket, EncryptedStream, EncryptedStreamOptions, EncryptedReader, EncryptedWriter};
 
 pub trait PacketTrait: Send + Sync + Sized {
     fn serialize(&self) -> ClavisResult<Vec<u8>>;
