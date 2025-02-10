@@ -103,30 +103,10 @@ macro_rules! protocol {
             $($contents:tt)*
         }
     ) => {
-        protocol! {
-        @subparser
-        {
-            $(#[$meta_root])*
-        },
-        ($vis, $name),
-        {},
-        $($contents)*
-        }
-    };
-
-    // Stop case
-    (
-    @subparser
-    {
-        $(#[$meta_root:meta])*
-    },
-    ($vis:vis, $name:ident),
-    { $($acc:tt)* },
-    ) => {
         #[derive($crate::prelude::serde::Serialize, $crate::prelude::serde::Deserialize)]
         $(#[$meta_root])*
         $vis enum $name {
-            $($acc)*
+            $($contents)*
         }
 
         impl $crate::PacketTrait for $name {
@@ -151,128 +131,6 @@ macro_rules! protocol {
                         "Failed to deserialize {}: {}", stringify!($enum_name), e
                     )))
             }
-        }
-    };
-
-    // Trailing comma case filter
-    (
-    @subparser
-    {
-        $(#[$meta_root:meta])*
-    },
-    ($vis:vis, $name:ident),
-    { $($acc:tt)* },
-    ,
-    $($tail:tt)*
-    ) => {
-        protocol! {
-        @subparser
-        {
-            $(#[$meta_root])*
-        },
-        ($vis, $name),
-        {
-            $($acc)*
-        },
-        $($tail)*
-        }
-    };
-
-    // Unit variant case
-    (
-    @subparser
-    {
-        $(#[$meta_root:meta])*
-    },
-    ($vis:vis, $name:ident),
-    { $($acc:tt)* },
-    $(#[$vmeta:meta])*
-    $v:ident,
-    $($tail:tt)*
-    ) => {
-        protocol! {
-        @subparser
-        {
-            $(#[$meta_root])*
-        },
-        ($vis, $name),
-        {
-            $($acc)*
-            $(#[$vmeta])*
-            $v,
-        },
-        $($tail)*
-        }
-    };
-
-    // Struct variant case
-    (
-    @subparser
-    {
-        $(#[$meta_root:meta])*
-    },
-    ($vis:vis, $name:ident),
-    { $($acc:tt)* },
-    $(#[$vmeta:meta])*
-    $v:ident {
-        $(
-            $(#[$fmeta:meta])*
-            $field:ident : $fty:ty
-        ),* $(,)?
-    }
-    $($tail:tt)*
-    ) => {
-        protocol! {
-        @subparser
-        {
-            $(#[$meta_root])*
-        },
-        ($vis, $name),
-        {
-            $($acc)*
-            $(#[$vmeta])*
-            $v {
-                $(
-                    $(#[$fmeta])*
-                    $field : $fty
-                ),*
-            },
-        },
-        $($tail)*
-        }
-    };
-
-    // Tuple variant case
-    (
-    @subparser
-    {
-        $(#[$meta_root:meta])*
-    },
-    ($vis:vis, $name:ident),
-    { $($acc:tt)* },
-    $(#[$vmeta:meta])*
-    $v:ident (
-        $( $(#[$tmeta:meta])* $sty:ty),+ $(,)?
-    )
-    $($tail:tt)*
-    ) => {
-        protocol! {
-        @subparser
-        {
-            $(#[$meta_root])*
-        },
-        ($vis, $name),
-        {
-            $($acc)*
-            $(#[$vmeta])*
-            $v (
-                $(
-                    $(#[$tmeta])*
-                    $sty
-                ),+
-            ),
-        },
-        $($tail)*
         }
     };
 }
